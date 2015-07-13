@@ -16,9 +16,7 @@ import tempfile
 import traceback
 import urlparse
 
-import download_from_google_storage
 import gclient_utils
-import git_cache
 import scm
 import shutil
 import subprocess2
@@ -174,14 +172,6 @@ class SCMWrapper(object):
     # Git
     if os.path.exists(os.path.join(self.checkout_path, '.git')):
       actual_remote_url = self._get_first_remote_url(self.checkout_path)
-
-      # If a cache_dir is used, obtain the actual remote URL from the cache.
-      if getattr(self, 'cache_dir', None):
-        url, _ = gclient_utils.SplitUrlRevision(self.url)
-        mirror = git_cache.Mirror(url)
-        if (mirror.exists() and mirror.mirror_path.replace('\\', '/') ==
-            actual_remote_url.replace('\\', '/')):
-          actual_remote_url = self._get_first_remote_url(mirror.mirror_path)
       return actual_remote_url
 
     # Svn
@@ -210,7 +200,7 @@ class SCMWrapper(object):
     Args:
         force: bool; if True, delete the directory. Otherwise, just move it.
     """
-    if force and os.environ.get('CHROME_HEADLESS') == '1':
+    if force:
       self.Print('_____ Conflicting directory found in %s. Removing.'
                  % self.checkout_path)
       gclient_utils.AddWarning('Conflicting directory %s deleted.'
@@ -387,10 +377,6 @@ class GitWrapper(SCMWrapper):
       # hash is also a tag, only make a distinction at checkout
       rev_type = "hash"
 
-    mirror = self._GetMirror(url, options)
-    if mirror:
-      url = mirror.mirror_path
-
     # If we are going to introduce a new project, there is a possibility that
     # we are syncing back to a state where the project was originally a
     # sub-project rolled by DEPS (realistic case: crossing the Blink merge point
@@ -408,8 +394,6 @@ class GitWrapper(SCMWrapper):
     if (not os.path.exists(self.checkout_path) or
         (os.path.isdir(self.checkout_path) and
          not os.path.exists(os.path.join(self.checkout_path, '.git')))):
-      if mirror:
-        self._UpdateMirror(mirror, options)
       try:
         self._Clone(revision, url, options)
       except subprocess2.CalledProcessError:
@@ -428,9 +412,6 @@ class GitWrapper(SCMWrapper):
       self._UpdateBranchHeads(options, fetch=False)
       self.Print('________ unmanaged solution; skipping %s' % self.relpath)
       return self._Capture(['rev-parse', '--verify', 'HEAD'])
-
-    if mirror:
-      self._UpdateMirror(mirror, options)
 
     # See if the url has changed (the unittests use git://foo for the url, let
     # that through).
@@ -452,11 +433,6 @@ class GitWrapper(SCMWrapper):
         self._CheckClean(rev_str)
       # Switch over to the new upstream
       self._Run(['remote', 'set-url', self.remote, url], options)
-      if mirror:
-        with open(os.path.join(
-            self.checkout_path, '.git', 'objects', 'info', 'alternates'),
-            'w') as fh:
-          fh.write(os.path.join(url, 'objects'))
       self._FetchAndReset(revision, file_list, options)
       return_early = True
 
@@ -826,37 +802,6 @@ class GitWrapper(SCMWrapper):
     staged/restored. Use case: subproject moved from DEPS <-> outer project."""
     return os.path.join(self._root_dir,
                         'old_' + self.relpath.replace(os.sep, '_')) + '.git'
-
-  def _GetMirror(self, url, options):
-    """Get a git_cache.Mirror object for the argument url."""
-    if not git_cache.Mirror.GetCachePath():
-      return None
-    mirror_kwargs = {
-        'print_func': self.filter,
-        'refs': []
-    }
-    if hasattr(options, 'with_branch_heads') and options.with_branch_heads:
-      mirror_kwargs['refs'].append('refs/branch-heads/*')
-    if hasattr(options, 'with_tags') and options.with_tags:
-      mirror_kwargs['refs'].append('refs/tags/*')
-    return git_cache.Mirror(url, **mirror_kwargs)
-
-  @staticmethod
-  def _UpdateMirror(mirror, options):
-    """Update a git mirror by fetching the latest commits from the remote."""
-    if getattr(options, 'shallow', False):
-      # HACK(hinoka): These repositories should be super shallow.
-      if 'flash' in mirror.url:
-        depth = 10
-      else:
-        depth = 10000
-    else:
-      depth = None
-    mirror.populate(verbose=options.verbose,
-                    bootstrap=not getattr(options, 'no_bootstrap', False),
-                    depth=depth,
-                    ignore_lock=getattr(options, 'ignore_locks', False))
-    mirror.unlock()
 
   def _Clone(self, revision, url, options):
     """Clone a git repository from the given URL.
@@ -1289,75 +1234,7 @@ class SVNWrapper(SCMWrapper):
         self._DeleteOrMove(options.force)
         exists = False
 
-    BASE_URLS = {
-        '/chrome/trunk/src': 'gs://chromium-svn-checkout/chrome/',
-        '/blink/trunk': 'gs://chromium-svn-checkout/blink/',
-    }
-    WHITELISTED_ROOTS = [
-        'svn://svn.chromium.org',
-        'svn://svn-mirror.golo.chromium.org',
-    ]
     if not exists:
-      try:
-        # Split out the revision number since it's not useful for us.
-        base_path = urlparse.urlparse(url).path.split('@')[0]
-        # Check to see if we're on a whitelisted root.  We do this because
-        # only some svn servers have matching UUIDs.
-        local_parsed = urlparse.urlparse(url)
-        local_root = '%s://%s' % (local_parsed.scheme, local_parsed.netloc)
-        if ('CHROME_HEADLESS' in os.environ
-            and sys.platform == 'linux2'  # TODO(hinoka): Enable for win/mac.
-            and base_path in BASE_URLS
-            and local_root in WHITELISTED_ROOTS):
-
-          # Use a tarball for initial sync if we are on a bot.
-          # Get an unauthenticated gsutil instance.
-          gsutil = download_from_google_storage.Gsutil(
-              GSUTIL_DEFAULT_PATH, boto_path=os.devnull)
-
-          gs_path = BASE_URLS[base_path]
-          _, out, _ = gsutil.check_call('ls', gs_path)
-          # So that we can get the most recent revision.
-          sorted_items = sorted(out.splitlines())
-          latest_checkout = sorted_items[-1]
-
-          tempdir = tempfile.mkdtemp()
-          self.Print('Downloading %s...' % latest_checkout)
-          code, out, err = gsutil.check_call('cp', latest_checkout, tempdir)
-          if code:
-            self.Print('%s\n%s' % (out, err))
-            raise Exception()
-          filename = latest_checkout.split('/')[-1]
-          tarball = os.path.join(tempdir, filename)
-          self.Print('Unpacking into %s...' % self.checkout_path)
-          gclient_utils.safe_makedirs(self.checkout_path)
-          # TODO(hinoka): Use 7z for windows.
-          cmd = ['tar', '--extract', '--ungzip',
-                  '--directory', self.checkout_path,
-                  '--file', tarball]
-          gclient_utils.CheckCallAndFilter(
-              cmd, stdout=sys.stdout, print_stdout=True)
-
-          self.Print('Deleting temp file')
-          gclient_utils.rmtree(tempdir)
-
-          # Rewrite the repository root to match.
-          tarball_url = scm.SVN.CaptureLocalInfo(
-              ['.'], self.checkout_path)['Repository Root']
-          tarball_parsed = urlparse.urlparse(tarball_url)
-          tarball_root = '%s://%s' % (tarball_parsed.scheme,
-                                      tarball_parsed.netloc)
-
-          if tarball_root != local_root:
-            self.Print('Switching repository root to %s' % local_root)
-            self._Run(['switch', '--relocate', tarball_root,
-                       local_root, self.checkout_path],
-                      options)
-      except Exception as e:
-        self.Print('We tried to get a source tarball but failed.')
-        self.Print('Resuming normal operations.')
-        self.Print(str(e))
-
       gclient_utils.safe_makedirs(os.path.dirname(self.checkout_path))
       # We need to checkout.
       command = ['checkout', url, self.checkout_path]

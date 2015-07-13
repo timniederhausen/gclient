@@ -5,14 +5,6 @@
 
 """Meta checkout manager supporting both Subversion and GIT."""
 # Files
-#   .gclient      : Current client configuration, written by 'config' command.
-#                   Format is a Python script defining 'solutions', a list whose
-#                   entries each are maps binding the strings "name" and "url"
-#                   to strings specifying the name and location of the client
-#                   module, as well as "custom_deps" to a map similar to the
-#                   deps section of the DEPS file below, as well as
-#                   "custom_hooks" to a list similar to the hooks sections of
-#                   the DEPS file below.
 #   .gclient_entries : A cache constructed by 'update' command.  Format is a
 #                   Python script defining 'entries', a list of the names
 #                   of all modules in the client
@@ -93,12 +85,9 @@ import time
 import urllib
 import urlparse
 
-import breakpad  # pylint: disable=W0611
-
 import fix_encoding
 import gclient_scm
 import gclient_utils
-import git_cache
 from third_party.repo.progress import Progress
 import subcommand
 import subprocess2
@@ -238,14 +227,6 @@ class DependencySettings(GClientKeywords):
     self._custom_vars = custom_vars or {}
     self._custom_deps = custom_deps or {}
     self._custom_hooks = custom_hooks or []
-
-    # TODO(iannucci): Remove this when all masters are correctly substituting
-    # the new blink url.
-    if (self._custom_vars.get('webkit_trunk', '') ==
-        'svn://svn-mirror.golo.chromium.org/webkit-readonly/trunk'):
-      new_url = 'svn://svn-mirror.golo.chromium.org/blink/trunk'
-      print 'Overwriting Var("webkit_trunk") with %s' % new_url
-      self._custom_vars['webkit_trunk'] = new_url
 
     # Post process the url to remove trailing slashes.
     if isinstance(self._url, basestring):
@@ -595,7 +576,9 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
 
     # First try to locate the configured deps file.  If it's missing, fallback
     # to DEPS.
-    deps_files = [self.deps_file]
+    deps_files = []
+    if self.deps_file:
+      deps_files.append(self.deps_file)
     if 'DEPS' not in deps_files:
       deps_files.append('DEPS')
     for deps_file in deps_files:
@@ -1163,42 +1146,11 @@ class GClient(Dependency):
     "android": "android",
   }
 
-  DEFAULT_CLIENT_FILE_TEXT = ("""\
-solutions = [
-  { "name"        : "%(solution_name)s",
-    "url"         : "%(solution_url)s",
-    "deps_file"   : "%(deps_file)s",
-    "managed"     : %(managed)s,
-    "custom_deps" : {
-    },
-    "safesync_url": "%(safesync_url)s",
-  },
-]
-cache_dir = %(cache_dir)r
-""")
-
-  DEFAULT_SNAPSHOT_SOLUTION_TEXT = ("""\
-  { "name"        : "%(solution_name)s",
-    "url"         : "%(solution_url)s",
-    "deps_file"   : "%(deps_file)s",
-    "managed"     : %(managed)s,
-    "custom_deps" : {
-%(solution_deps)s    },
-    "safesync_url": "%(safesync_url)s",
-  },
-""")
-
-  DEFAULT_SNAPSHOT_FILE_TEXT = ("""\
-# Snapshot generated with gclient revinfo --snapshot
-solutions = [
-%(solution_list)s]
-""")
-
   def __init__(self, root_dir, options):
     # Do not change previous behavior. Only solution level and immediate DEPS
     # are processed.
     self._recursion_limit = 2
-    Dependency.__init__(self, None, None, None, None, True, None, None, None,
+    Dependency.__init__(self, None, "GClient", None, None, True, None, None, None,
                         'unused', True)
     self._options = options
     if options.deps_os:
@@ -1209,7 +1161,6 @@ solutions = [
       enforced_os = self.DEPS_OS_CHOICES.itervalues()
     self._enforced_os = tuple(set(enforced_os))
     self._root_dir = root_dir
-    self.config_content = None
 
   def _CheckConfig(self):
     """Verify that the config matches the state of the existing checked-out
@@ -1240,174 +1191,9 @@ want to set 'managed': False in .gclient.
         'actual_url': actual_url,
         'actual_scm': gclient_scm.GetScmName(actual_url)})
 
-  def SetConfig(self, content):
-    assert not self.dependencies
-    config_dict = {}
-    self.config_content = content
-    try:
-      exec(content, config_dict)
-    except SyntaxError, e:
-      gclient_utils.SyntaxErrorToError('.gclient', e)
-
-    # Append any target OS that is not already being enforced to the tuple.
-    target_os = config_dict.get('target_os', [])
-    if config_dict.get('target_os_only', False):
-      self._enforced_os = tuple(set(target_os))
-    else:
-      self._enforced_os = tuple(set(self._enforced_os).union(target_os))
-
-    cache_dir = config_dict.get('cache_dir')
-    if cache_dir:
-      cache_dir = os.path.join(self.root_dir, cache_dir)
-      cache_dir = os.path.abspath(cache_dir)
-      # If running on a bot, force break any stale git cache locks.
-      if os.path.exists(cache_dir) and os.environ.get('CHROME_HEADLESS'):
-        subprocess2.check_call(['git', 'cache', 'unlock', '--cache-dir',
-                                cache_dir, '--force', '--all'])
-    gclient_scm.GitWrapper.cache_dir = cache_dir
-    git_cache.Mirror.SetCachePath(cache_dir)
-
-    if not target_os and config_dict.get('target_os_only', False):
-      raise gclient_utils.Error('Can\'t use target_os_only if target_os is '
-                                'not specified')
-
-    deps_to_add = []
-    for s in config_dict.get('solutions', []):
-      try:
-        deps_to_add.append(Dependency(
-            self, s['name'], s['url'],
-            s.get('safesync_url', None),
-            s.get('managed', True),
-            s.get('custom_deps', {}),
-            s.get('custom_vars', {}),
-            s.get('custom_hooks', []),
-            s.get('deps_file', 'DEPS'),
-            True))
-      except KeyError:
-        raise gclient_utils.Error('Invalid .gclient file. Solution is '
-                                  'incomplete: %s' % s)
-    self.add_dependencies_and_close(deps_to_add, config_dict.get('hooks', []))
-    logging.info('SetConfig() done')
-
-  def SaveConfig(self):
-    gclient_utils.FileWrite(os.path.join(self.root_dir,
-                                         self._options.config_filename),
-                            self.config_content)
-
-  def MigrateConfigToGit(self, path, options):
-    svn_url_re = re.compile('^(https?://src\.chromium\.org/svn|'
-                            'svn://svn\.chromium\.org/chrome)/'
-                            '(trunk|branches/[^/]+)/src')
-    old_git_re = re.compile('^(https?://git\.chromium\.org|'
-                            'ssh://([a-zA-Z_][a-zA-Z0-9_-]*@)?'
-                            'gerrit\.chromium\.org(:2941[89])?)/'
-                            'chromium/src\.git')
-    # Scan existing .gclient file for obsolete settings.  It would be simpler
-    # to traverse self.dependencies, but working with the AST allows the code to
-    # dump an updated .gclient file that preserves the ordering of the original.
-    a = ast.parse(self.config_content, options.config_filename, 'exec')
-    modified = False
-    solutions = [elem for elem in a.body if 'solutions' in
-                 [target.id for target in elem.targets]]
-    if not solutions:
-      return self
-    solutions = solutions[-1]
-    for solution in solutions.value.elts:
-      # Check for obsolete URL's
-      url_idx = ast_dict_index(solution, 'url')
-      if url_idx == -1:
-        continue
-      url_val = solution.values[url_idx]
-      if type(url_val) is not ast.Str:
-        continue
-      if (svn_url_re.match(url_val.s.strip())):
-        raise gclient_utils.Error(
-"""
-The chromium code repository has migrated completely to git.
-Your SVN-based checkout is now obsolete; you need to create a brand-new
-git checkout by following these instructions:
-
-http://www.chromium.org/developers/how-tos/get-the-code
-""")
-      if (old_git_re.match(url_val.s.strip())):
-        url_val.s = CHROMIUM_SRC_URL
-        modified = True
-
-      # Ensure deps_file is set to .DEPS.git.  We enforce this here to smooth
-      # over switching between pre-git-migration and post-git-migration
-      # revisions.
-      #   - For pre-migration revisions, .DEPS.git must be explicitly set.
-      #   - For post-migration revisions, .DEPS.git is not present, so gclient
-      #     will correctly fall back to DEPS.
-      if url_val.s == CHROMIUM_SRC_URL:
-        deps_file_idx = ast_dict_index(solution, 'deps_file')
-        if deps_file_idx != -1:
-          continue
-        solution.keys.append(ast.Str('deps_file'))
-        solution.values.append(ast.Str('.DEPS.git'))
-        modified = True
-
-    if not modified:
-      return self
-
-    print(
-"""
-WARNING: gclient detected an obsolete setting in your %s file.  The file has
-been automagically updated.  The previous version is available at %s.old.
-""" % (options.config_filename, options.config_filename))
-
-    # Replace existing .gclient with the updated version.
-    # Return a new GClient instance based on the new content.
-    new_content = ast2str(a)
-    dot_gclient_fn = os.path.join(path, options.config_filename)
-    try:
-      os.rename(dot_gclient_fn, dot_gclient_fn + '.old')
-    except OSError:
-      pass
-    with open(dot_gclient_fn, 'w') as fh:
-      fh.write(new_content)
-    client = GClient(path, options)
-    client.SetConfig(new_content)
-    return client
-
   @staticmethod
   def LoadCurrentConfig(options):
-    """Searches for and loads a .gclient file relative to the current working
-    dir. Returns a GClient object."""
-    if options.spec:
-      client = GClient('.', options)
-      client.SetConfig(options.spec)
-    else:
-      path = gclient_utils.FindGclientRoot(os.getcwd(), options.config_filename)
-      if not path:
-        return None
-      client = GClient(path, options)
-      client.SetConfig(gclient_utils.FileRead(
-          os.path.join(path, options.config_filename)))
-      client = client.MigrateConfigToGit(path, options)
-
-    if (options.revisions and
-        len(client.dependencies) > 1 and
-        any('@' not in r for r in options.revisions)):
-      print >> sys.stderr, (
-          'You must specify the full solution name like --revision %s@%s\n'
-          'when you have multiple solutions setup in your .gclient file.\n'
-          'Other solutions present are: %s.') % (
-              client.dependencies[0].name,
-              options.revisions[0],
-              ', '.join(s.name for s in client.dependencies[1:]))
-    return client
-
-  def SetDefaultConfig(self, solution_name, deps_file, solution_url,
-                       safesync_url, managed=True, cache_dir=None):
-    self.SetConfig(self.DEFAULT_CLIENT_FILE_TEXT % {
-      'solution_name': solution_name,
-      'solution_url': solution_url,
-      'deps_file': deps_file,
-      'safesync_url' : safesync_url,
-      'managed': managed,
-      'cache_dir': cache_dir,
-    })
+    return GClient('.', options)
 
   def _SaveEntries(self):
     """Creates a .gclient_entries file to record the list of unique checkouts.
@@ -1496,8 +1282,7 @@ been automagically updated.  The previous version is available at %s.old.
       command: The command to use (e.g., 'status' or 'diff')
       args: list of str - extra arguments to add to the command line.
     """
-    if not self.dependencies:
-      raise gclient_utils.Error('No solution specified')
+    self.ParseDepsFile()
 
     revision_overrides = {}
     # It's unnecessary to check for revision overrides for 'recurse'.
@@ -1651,49 +1436,17 @@ been automagically updated.  The previous version is available at %s.old.
         return None
       return '%s@%s' % (url, scm.revinfo(self._options, [], None))
 
-    if self._options.snapshot:
-      new_gclient = ''
-      # First level at .gclient
-      for d in self.dependencies:
-        entries = {}
-        def GrabDeps(dep):
-          """Recursively grab dependencies."""
-          for d in dep.dependencies:
-            entries[d.name] = GetURLAndRev(d)
-            GrabDeps(d)
-        GrabDeps(d)
-        custom_deps = []
-        for k in sorted(entries.keys()):
-          if entries[k]:
-            # Quotes aren't escaped...
-            custom_deps.append('      \"%s\": \'%s\',\n' % (k, entries[k]))
-          else:
-            custom_deps.append('      \"%s\": None,\n' % k)
-        new_gclient += self.DEFAULT_SNAPSHOT_SOLUTION_TEXT % {
-            'solution_name': d.name,
-            'solution_url': d.url,
-            'deps_file': d.deps_file,
-            'safesync_url' : d.safesync_url or '',
-            'managed': d.managed,
-            'solution_deps': ''.join(custom_deps),
-        }
-      # Print the snapshot configuration file
-      print(self.DEFAULT_SNAPSHOT_FILE_TEXT % {'solution_list': new_gclient})
-    else:
-      entries = {}
-      for d in self.root.subtree(False):
-        if self._options.actual:
-          entries[d.name] = GetURLAndRev(d)
-        else:
-          entries[d.name] = d.parsed_url
-      keys = sorted(entries.keys())
-      for x in keys:
-        print('%s: %s' % (x, entries[x]))
-    logging.info(str(self))
+    entries = {}
+    for d in self.root.subtree(False):
+      if self._options.actual:
+        entries[d.name] = GetURLAndRev(d)
+      else:
+        entries[d.name] = d.parsed_url
+    keys = sorted(entries.keys())
+    for x in keys:
+      print('%s: %s' % (x, entries[x]))
 
-  def ParseDepsFile(self):
-    """No DEPS to parse for a .gclient file."""
-    raise gclient_utils.Error('Internal error')
+    logging.info(str(self))
 
   @property
   def root_dir(self):
@@ -1736,10 +1489,6 @@ def CMDcleanup(parser, args):
   client = GClient.LoadCurrentConfig(options)
   if not client:
     raise gclient_utils.Error('client not configured; see \'gclient config\'')
-  if options.verbose:
-    # Print out the .gclient file.  This is longer than if we just printed the
-    # client dict, but more legible, and it might contain helpful comments.
-    print(client.config_content)
   return client.RunOnDeps('cleanup', args)
 
 
@@ -1833,70 +1582,6 @@ def CMDroot(parser, args):
   else:
     print(os.path.abspath('.'))
 
-
-@subcommand.usage('[url] [safesync url]')
-def CMDconfig(parser, args):
-  """Creates a .gclient file in the current directory.
-
-  This specifies the configuration for further commands. After update/sync,
-  top-level DEPS files in each module are read to determine dependent
-  modules to operate on as well. If optional [url] parameter is
-  provided, then configuration is read from a specified Subversion server
-  URL.
-  """
-  # We do a little dance with the --gclientfile option.  'gclient config' is the
-  # only command where it's acceptable to have both '--gclientfile' and '--spec'
-  # arguments.  So, we temporarily stash any --gclientfile parameter into
-  # options.output_config_file until after the (gclientfile xor spec) error
-  # check.
-  parser.remove_option('--gclientfile')
-  parser.add_option('--gclientfile', dest='output_config_file',
-                    help='Specify an alternate .gclient file')
-  parser.add_option('--name',
-                    help='overrides the default name for the solution')
-  parser.add_option('--deps-file', default='DEPS',
-                    help='overrides the default name for the DEPS file for the'
-                         'main solutions and all sub-dependencies')
-  parser.add_option('--unmanaged', action='store_true', default=False,
-                    help='overrides the default behavior to make it possible '
-                         'to have the main solution untouched by gclient '
-                         '(gclient will check out unmanaged dependencies but '
-                         'will never sync them)')
-  parser.add_option('--cache-dir',
-                    help='(git only) Cache all git repos into this dir and do '
-                         'shared clones from the cache, instead of cloning '
-                         'directly from the remote. (experimental)')
-  parser.set_defaults(config_filename=None)
-  (options, args) = parser.parse_args(args)
-  if options.output_config_file:
-    setattr(options, 'config_filename', getattr(options, 'output_config_file'))
-  if ((options.spec and args) or len(args) > 2 or
-      (not options.spec and not args)):
-    parser.error('Inconsistent arguments. Use either --spec or one or 2 args')
-
-  client = GClient('.', options)
-  if options.spec:
-    client.SetConfig(options.spec)
-  else:
-    base_url = args[0].rstrip('/')
-    if not options.name:
-      name = base_url.split('/')[-1]
-      if name.endswith('.git'):
-        name = name[:-4]
-    else:
-      # specify an alternate relpath for the given URL.
-      name = options.name
-    deps_file = options.deps_file
-    safesync_url = ''
-    if len(args) > 1:
-      safesync_url = args[1]
-    client.SetDefaultConfig(name, deps_file, base_url, safesync_url,
-                            managed=not options.unmanaged,
-                            cache_dir=options.cache_dir)
-  client.SaveConfig()
-  return 0
-
-
 @subcommand.epilog("""Example:
   gclient pack > patch.txt
     generate simple patch for configured client and dependences
@@ -1920,10 +1605,6 @@ def CMDpack(parser, args):
   client = GClient.LoadCurrentConfig(options)
   if not client:
     raise gclient_utils.Error('client not configured; see \'gclient config\'')
-  if options.verbose:
-    # Print out the .gclient file.  This is longer than if we just printed the
-    # client dict, but more legible, and it might contain helpful comments.
-    print(client.config_content)
   return client.RunOnDeps('pack', args)
 
 
@@ -1937,10 +1618,6 @@ def CMDstatus(parser, args):
   client = GClient.LoadCurrentConfig(options)
   if not client:
     raise gclient_utils.Error('client not configured; see \'gclient config\'')
-  if options.verbose:
-    # Print out the .gclient file.  This is longer than if we just printed the
-    # client dict, but more legible, and it might contain helpful comments.
-    print(client.config_content)
   return client.RunOnDeps('status', args)
 
 
@@ -2049,10 +1726,6 @@ def CMDsync(parser, args):
     # TODO(maruel): Make it a parser.error if it doesn't break any builder.
     print('Warning: you cannot use both --head and --revision')
 
-  if options.verbose:
-    # Print out the .gclient file.  This is longer than if we just printed the
-    # client dict, but more legible, and it might contain helpful comments.
-    print(client.config_content)
   ret = client.RunOnDeps('update', args)
   if options.output_json:
     slns = {}
@@ -2081,10 +1754,7 @@ def CMDdiff(parser, args):
   client = GClient.LoadCurrentConfig(options)
   if not client:
     raise gclient_utils.Error('client not configured; see \'gclient config\'')
-  if options.verbose:
-    # Print out the .gclient file.  This is longer than if we just printed the
-    # client dict, but more legible, and it might contain helpful comments.
-    print(client.config_content)
+
   return client.RunOnDeps('diff', args)
 
 
@@ -2126,10 +1796,7 @@ def CMDrunhooks(parser, args):
   client = GClient.LoadCurrentConfig(options)
   if not client:
     raise gclient_utils.Error('client not configured; see \'gclient config\'')
-  if options.verbose:
-    # Print out the .gclient file.  This is longer than if we just printed the
-    # client dict, but more legible, and it might contain helpful comments.
-    print(client.config_content)
+
   options.force = True
   options.nohooks = False
   return client.RunOnDeps('runhooks', args)
@@ -2151,10 +1818,6 @@ def CMDrevinfo(parser, args):
   parser.add_option('-a', '--actual', action='store_true',
                     help='gets the actual checked out revisions instead of the '
                          'ones specified in the DEPS and .gclient files')
-  parser.add_option('-s', '--snapshot', action='store_true',
-                    help='creates a snapshot .gclient file of the current '
-                         'version of all repositories to reproduce the tree, '
-                         'implies -a')
   (options, args) = parser.parse_args(args)
   client = GClient.LoadCurrentConfig(options)
   if not client:
