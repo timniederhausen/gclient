@@ -1150,8 +1150,8 @@ class GClient(Dependency):
     # Do not change previous behavior. Only solution level and immediate DEPS
     # are processed.
     self._recursion_limit = 2
-    Dependency.__init__(self, None, "GClient", None, None, True, None, None, None,
-                        'unused', True)
+    Dependency.__init__(self, None, '', None, None, True, None, None, None,
+                        'DEPS', True)
     self._options = options
     if options.deps_os:
       enforced_os = options.deps_os.split(',')
