@@ -1150,7 +1150,7 @@ class GClient(Dependency):
     # Do not change previous behavior. Only solution level and immediate DEPS
     # are processed.
     self._recursion_limit = 2
-    Dependency.__init__(self, None, '', None, None, True, None, None, None,
+    Dependency.__init__(self, None, '', None, None, True, None, options.custom_vars, None,
                         'DEPS', True)
     self._options = options
     if options.deps_os:
@@ -1896,6 +1896,12 @@ class OptionParser(optparse.OptionParser):
     self.add_option(
         '--no-nag-max', default=False, action='store_true',
         help='Ignored for backwards compatibility.')
+    self.add_option(
+        '--env', dest='environment_filename',
+        help='Custom variables')
+    self.add_option(
+        '--set', action='append', dest='custom_vars', nargs=2, type='string',
+        help='Set one variable')
 
   def parse_args(self, args=None, values=None):
     """Integrates standard options processing."""
@@ -1911,6 +1917,14 @@ class OptionParser(optparse.OptionParser):
       self.error('--gclientfile target must be a filename, not a path')
     if not options.config_filename:
       options.config_filename = self.gclientfile_default
+
+    custom_vars = {}
+    for name, value in options.custom_vars:
+      custom_vars[name] = value
+    if options.environment_filename:
+      custom_vars.merge(self.load_environment(options.environment_filename))
+    options.custom_vars = custom_vars
+
     options.entries_filename = options.config_filename + '_entries'
     if options.jobs < 1:
       self.error('--jobs must be 1 or higher')
@@ -1933,6 +1947,21 @@ class OptionParser(optparse.OptionParser):
       options.force = None
     return (options, args)
 
+  def load_environment(self, filename):
+    vars = {}
+    with open(filename) as f:
+      for line in f:
+        line = line.strip()
+        if not line:
+          continue
+
+        tokens = [t.strip() for t in line.split('=')]
+        if len(tokens) != 2:
+          raise Exception("Invalid token count")
+
+        vars[tokens[0]] = tokens[1]
+
+    return vars
 
 def disable_buffering():
   # Make stdout auto-flush so buildbot doesn't kill us during lengthy
