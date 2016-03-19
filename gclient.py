@@ -1900,7 +1900,7 @@ class OptionParser(optparse.OptionParser):
         '--env', dest='environment_filename',
         help='Custom variables')
     self.add_option(
-        '--set', action='append', dest='custom_vars', nargs=2, type='string',
+        '--set', action='append', dest='custom_vars', default=[], nargs=2, type='string',
         help='Set one variable')
 
   def parse_args(self, args=None, values=None):
