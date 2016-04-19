@@ -159,41 +159,6 @@ class SCMWrapper(object):
 
     return getattr(self, command)(options, args, file_list)
 
-  @staticmethod
-  def _get_first_remote_url(checkout_path):
-    log = scm.GIT.Capture(
-        ['config', '--local', '--get-regexp', r'remote.*.url'],
-        cwd=checkout_path)
-    # Get the second token of the first line of the log.
-    return log.splitlines()[0].split(' ', 1)[1]
-
-  def GetActualRemoteURL(self, options):
-    """Attempt to determine the remote URL for this SCMWrapper."""
-    # Git
-    if os.path.exists(os.path.join(self.checkout_path, '.git')):
-      actual_remote_url = self._get_first_remote_url(self.checkout_path)
-      return actual_remote_url
-
-    # Svn
-    if os.path.exists(os.path.join(self.checkout_path, '.svn')):
-      return scm.SVN.CaptureLocalInfo([], self.checkout_path)['URL']
-    return None
-
-  def DoesRemoteURLMatch(self, options):
-    """Determine whether the remote URL of this checkout is the expected URL."""
-    if not os.path.exists(self.checkout_path):
-      # A checkout which doesn't exist can't be broken.
-      return True
-
-    actual_remote_url = self.GetActualRemoteURL(options)
-    if actual_remote_url:
-      return (gclient_utils.SplitUrlRevision(actual_remote_url)[0].rstrip('/')
-              == gclient_utils.SplitUrlRevision(self.url)[0].rstrip('/'))
-    else:
-      # This may occur if the self.checkout_path exists but does not contain a
-      # valid git or svn checkout.
-      return False
-
   def _DeleteOrMove(self, force):
     """Delete the checkout directory or move it out of the way.
 

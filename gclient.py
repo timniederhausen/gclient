@@ -1162,35 +1162,6 @@ class GClient(Dependency):
     self._enforced_os = tuple(set(enforced_os))
     self._root_dir = root_dir
 
-  def _CheckConfig(self):
-    """Verify that the config matches the state of the existing checked-out
-    solutions."""
-    for dep in self.dependencies:
-      if dep.managed and dep.url:
-        scm = gclient_scm.CreateSCM(
-            dep.url, self.root_dir, dep.name, self.outbuf)
-        actual_url = scm.GetActualRemoteURL(self._options)
-        if actual_url and not scm.DoesRemoteURLMatch(self._options):
-          raise gclient_utils.Error('''
-Your .gclient file seems to be broken. The requested URL is different from what
-is actually checked out in %(checkout_path)s.
-
-The .gclient file contains:
-%(expected_url)s (%(expected_scm)s)
-
-The local checkout in %(checkout_path)s reports:
-%(actual_url)s (%(actual_scm)s)
-
-You should ensure that the URL listed in .gclient is correct and either change
-it or fix the checkout. If you're managing your own git checkout in
-%(checkout_path)s but the URL in .gclient is for an svn repository, you probably
-want to set 'managed': False in .gclient.
-'''  % {'checkout_path': os.path.join(self.root_dir, dep.name),
-        'expected_url': dep.url,
-        'expected_scm': gclient_scm.GetScmName(dep.url),
-        'actual_url': actual_url,
-        'actual_scm': gclient_scm.GetScmName(actual_url)})
-
   @staticmethod
   def LoadCurrentConfig(options):
     return GClient('.', options)
@@ -1288,7 +1259,6 @@ want to set 'managed': False in .gclient.
     # It's unnecessary to check for revision overrides for 'recurse'.
     # Save a few seconds by not calling _EnforceRevisions() in that case.
     if command not in ('diff', 'recurse', 'runhooks', 'status', 'revert'):
-      self._CheckConfig()
       revision_overrides = self._EnforceRevisions()
     pm = None
     # Disable progress for non-tty stdout.
