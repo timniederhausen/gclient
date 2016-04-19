@@ -1174,6 +1174,16 @@ def NumLocalCpus():
   return 1
 
 
+def GetWindowsArchitecture():
+  true_platform = os.environ['PROCESSOR_ARCHITECTURE']
+  try:
+    true_platform = os.environ["PROCESSOR_ARCHITEW6432"]
+  except KeyError:
+    pass
+
+  return true_platform
+
+
 def DefaultDeltaBaseCacheLimit():
   """Return a reasonable default for the git config core.deltaBaseCacheLimit.
 
@@ -1181,7 +1191,14 @@ def DefaultDeltaBaseCacheLimit():
   size limit is per-thread, and 32-bit systems can hit OOM errors if this
   parameter is set too high.
   """
-  if platform.architecture()[0].startswith('64'):
+  is_64bit = False
+  try:
+    is_64bit = "AMD64" == GetWindowsArchitecture()
+  except KeyError:
+    # We want the platform's architecture, not the our Python interpreter's.
+    is_64bit = platform.architecture()[0].startswith('64')
+
+  if is_64bit:
     return '2g'
   else:
     return '512m'
