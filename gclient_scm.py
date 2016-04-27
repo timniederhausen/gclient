@@ -367,10 +367,6 @@ class GitWrapper(SCMWrapper):
       # hash is also a tag, only make a distinction at checkout
       rev_type = "hash"
 
-    mirror = self._GetMirror(url, options)
-    if mirror:
-      url = mirror.mirror_path
-
     # If we are going to introduce a new project, there is a possibility that
     # we are syncing back to a state where the project was originally a
     # sub-project rolled by DEPS (realistic case: crossing the Blink merge point
@@ -408,9 +404,6 @@ class GitWrapper(SCMWrapper):
       return self._Capture(['rev-parse', '--verify', 'HEAD'])
 
     self._maybe_break_locks(options)
-
-    if mirror:
-      self._UpdateMirror(mirror, options)
 
     # See if the url has changed.
     current_url = self._Capture(['config', 'remote.%s.url' % self.remote])
@@ -811,38 +804,6 @@ class GitWrapper(SCMWrapper):
     staged/restored. Use case: subproject moved from DEPS <-> outer project."""
     return os.path.join(self._root_dir,
                         'old_' + self.relpath.replace(os.sep, '_')) + '.git'
-
-  def _GetMirror(self, url, options):
-    """Get a git_cache.Mirror object for the argument url."""
-    if not git_cache.Mirror.GetCachePath():
-      return None
-    mirror_kwargs = {
-        'print_func': self.filter,
-        'refs': []
-    }
-    if hasattr(options, 'with_branch_heads') and options.with_branch_heads:
-      mirror_kwargs['refs'].append('refs/branch-heads/*')
-    if hasattr(options, 'with_tags') and options.with_tags:
-      mirror_kwargs['refs'].append('refs/tags/*')
-    return git_cache.Mirror(url, **mirror_kwargs)
-
-  @staticmethod
-  def _UpdateMirror(mirror, options):
-    """Update a git mirror by fetching the latest commits from the remote."""
-    if getattr(options, 'shallow', False):
-      # HACK(hinoka): These repositories should be super shallow.
-      if 'flash' in mirror.url:
-        depth = 10
-      else:
-        depth = 10000
-    else:
-      depth = None
-    mirror.populate(verbose=options.verbose,
-                    bootstrap=not getattr(options, 'no_bootstrap', False),
-                    depth=depth,
-                    ignore_lock=getattr(options, 'ignore_locks', False),
-                    lock_timeout=getattr(options, 'lock_timeout', 0))
-    mirror.unlock()
 
   def _Clone(self, revision, url, options):
     """Clone a git repository from the given URL.
