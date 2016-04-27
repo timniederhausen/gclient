@@ -367,6 +367,10 @@ class GitWrapper(SCMWrapper):
       # hash is also a tag, only make a distinction at checkout
       rev_type = "hash"
 
+    mirror = self._GetMirror(url, options)
+    if mirror:
+      url = mirror.mirror_path
+
     # If we are going to introduce a new project, there is a possibility that
     # we are syncing back to a state where the project was originally a
     # sub-project rolled by DEPS (realistic case: crossing the Blink merge point
