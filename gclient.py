@@ -68,6 +68,8 @@
 #     target_os = [ "ios" ]
 #     target_os_only = True
 
+from __future__ import print_function
+
 __version__ = '0.7'
 
 import ast
@@ -91,7 +93,7 @@ import gclient_utils
 from third_party.repo.progress import Progress
 import subcommand
 import subprocess2
-from third_party import colorama
+import setup_color
 
 CHROMIUM_SRC_URL = 'https://chromium.googlesource.com/chromium/src.git'
 
@@ -619,7 +621,7 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
       # Eval the content.
       try:
         exec(deps_content, global_scope, local_scope)
-      except SyntaxError, e:
+      except SyntaxError as e:
         gclient_utils.SyntaxErrorToError(filepath, e)
       if use_strict:
         for key, val in local_scope.iteritems():
@@ -692,7 +694,7 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
     for name, url in deps.iteritems():
       should_process = self.recursion_limit and self.should_process
       deps_to_add.append(Dependency(
-          self, name, url, None, True, None, None, None,
+          self, name, url, None, True, None, self.custom_vars, None,
           self.deps_file, should_process))
     deps_to_add.sort(key=lambda x: x.name)
 
@@ -867,24 +869,24 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
 
               match = re.match('^Binary file ([^\0]+) matches$', line)
               if match:
-                print 'Binary file %s matches\n' % mod_path(match.group(1))
+                print('Binary file %s matches\n' % mod_path(match.group(1)))
                 return
 
               items = line.split('\0')
               if len(items) == 2 and items[1]:
-                print '%s : %s' % (mod_path(items[0]), items[1])
+                print('%s : %s' % (mod_path(items[0]), items[1]))
               elif len(items) >= 2:
                 # Multiple null bytes or a single trailing null byte indicate
                 # git is likely displaying filenames only (such as with -l)
-                print '\n'.join(mod_path(path) for path in items if path)
+                print('\n'.join(mod_path(path) for path in items if path))
               else:
-                print line
+                print(line)
           else:
             print_stdout = True
             filter_fn = None
 
           if parsed_url is None:
-            print >> sys.stderr, 'Skipped omitted dependency %s' % cwd
+            print('Skipped omitted dependency %s' % cwd, file=sys.stderr)
           elif os.path.isdir(cwd):
             try:
               gclient_utils.CheckCallAndFilter(
@@ -895,7 +897,7 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
               if not options.ignore:
                 raise
           else:
-            print >> sys.stderr, 'Skipped missing %s' % cwd
+            print('Skipped missing %s' % cwd, file=sys.stderr)
 
 
   @gclient_utils.lockedmethod
@@ -964,17 +966,17 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
         start_time = time.time()
         gclient_utils.CheckCallAndFilterAndHeader(
             hook, cwd=self.root.root_dir, always=True)
-      except (gclient_utils.Error, subprocess2.CalledProcessError), e:
+      except (gclient_utils.Error, subprocess2.CalledProcessError) as e:
         # Use a discrete exit status code of 2 to indicate that a hook action
         # failed.  Users of this script may wish to treat hook action failures
         # differently from VC failures.
-        print >> sys.stderr, 'Error: %s' % str(e)
+        print('Error: %s' % str(e), file=sys.stderr)
         sys.exit(2)
       finally:
         elapsed_time = time.time() - start_time
         if elapsed_time > 10:
-          print "Hook '%s' took %.2f secs" % (
-              gclient_utils.CommandToStr(hook), elapsed_time)
+          print("Hook '%s' took %.2f secs" % (
+              gclient_utils.CommandToStr(hook), elapsed_time))
 
   def RunPreDepsHooks(self):
     assert self.processed
@@ -989,17 +991,17 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
         start_time = time.time()
         gclient_utils.CheckCallAndFilterAndHeader(
             hook, cwd=self.root.root_dir, always=True)
-      except (gclient_utils.Error, subprocess2.CalledProcessError), e:
+      except (gclient_utils.Error, subprocess2.CalledProcessError) as e:
         # Use a discrete exit status code of 2 to indicate that a hook action
         # failed.  Users of this script may wish to treat hook action failures
         # differently from VC failures.
-        print >> sys.stderr, 'Error: %s' % str(e)
+        print('Error: %s' % str(e), file=sys.stderr)
         sys.exit(2)
       finally:
         elapsed_time = time.time() - start_time
         if elapsed_time > 10:
-          print "Hook '%s' took %.2f secs" % (
-              gclient_utils.CommandToStr(hook), elapsed_time)
+          print("Hook '%s' took %.2f secs" % (
+              gclient_utils.CommandToStr(hook), elapsed_time))
 
 
   def subtree(self, include_all):
@@ -1197,7 +1199,7 @@ class GClient(Dependency):
       return {}
     try:
       exec(gclient_utils.FileRead(filename), scope)
-    except SyntaxError, e:
+    except SyntaxError as e:
       gclient_utils.SyntaxErrorToError(filename, e)
     return scope['entries']
 
@@ -1262,7 +1264,7 @@ class GClient(Dependency):
       revision_overrides = self._EnforceRevisions()
     pm = None
     # Disable progress for non-tty stdout.
-    if (sys.stdout.isatty() and not self._options.verbose and progress):
+    if (setup_color.IS_TTY and not self._options.verbose and progress):
       if command in ('update', 'revert'):
         pm = Progress('Syncing projects', 1)
       elif command == 'recurse':
@@ -1274,8 +1276,8 @@ class GClient(Dependency):
       work_queue.enqueue(s)
     work_queue.flush(revision_overrides, command, args, options=self._options)
     if revision_overrides:
-      print >> sys.stderr, ('Please fix your script, having invalid '
-                            '--revision flags will soon considered an error.')
+      print('Please fix your script, having invalid --revision flags will soon '
+            'considered an error.', file=sys.stderr)
 
     # Once all the dependencies have been processed, it's now safe to run the
     # hooks.
@@ -1482,13 +1484,14 @@ def CMDrecurse(parser, args):
                     help='Disable progress bar that shows sub-command updates')
   options, args = parser.parse_args(args)
   if not args:
-    print >> sys.stderr, 'Need to supply a command!'
+    print('Need to supply a command!', file=sys.stderr)
     return 1
   root_and_entries = gclient_utils.GetGClientRootAndEntries()
   if not root_and_entries:
-    print >> sys.stderr, (
+    print(
         'You need to run gclient sync at least once to use \'recurse\'.\n'
-        'This is because .gclient_entries needs to exist and be up to date.')
+        'This is because .gclient_entries needs to exist and be up to date.',
+        file=sys.stderr)
     return 1
 
   # Normalize options.scm to a set()
@@ -1522,13 +1525,13 @@ def CMDgrep(parser, args):
   # We can't use optparse because it will try to parse arguments sent
   # to git grep and throw an error. :-(
   if not args or re.match('(-h|--help)$', args[0]):
-    print >> sys.stderr, (
+    print(
         'Usage: gclient grep [-j <N>] git-grep-args...\n\n'
         'Example: "gclient grep -j10 -A2 RefCountedBase" runs\n"git grep '
         '-A2 RefCountedBase" on each of gclient\'s git\nrepos with up to '
         '10 jobs.\n\nBonus: page output by appending "|& less -FRSX" to the'
-        ' end of your query.'
-        )
+        ' end of your query.',
+        file=sys.stderr)
     return 1
 
   jobs_arg = ['--jobs=1']
@@ -1686,6 +1689,14 @@ def CMDsync(parser, args):
                     help='Don\'t bootstrap from Google Storage.')
   parser.add_option('--ignore_locks', action='store_true',
                     help='GIT ONLY - Ignore cache locks.')
+  parser.add_option('--break_repo_locks', action='store_true',
+                    help='GIT ONLY - Forcibly remove repo locks (e.g. '
+                      'index.lock). This should only be used if you know for '
+                      'certain that this invocation of gclient is the only '
+                      'thing operating on the git repos (e.g. on a bot).')
+  parser.add_option('--lock_timeout', type='int', default=5000,
+                    help='GIT ONLY - Deadline (in seconds) to wait for git '
+                         'cache lock to become available. Default is %default.')
   (options, args) = parser.parse_args(args)
   client = GClient.LoadCurrentConfig(options)
 
@@ -1743,6 +1754,11 @@ def CMDrevert(parser, args):
                     help='don\'t run pre-DEPS hooks', default=False)
   parser.add_option('--upstream', action='store_true',
                     help='Make repo state match upstream branch.')
+  parser.add_option('--break_repo_locks', action='store_true',
+                    help='GIT ONLY - Forcibly remove repo locks (e.g. '
+                      'index.lock). This should only be used if you know for '
+                      'certain that this invocation of gclient is the only '
+                      'thing operating on the git repos (e.g. on a bot).')
   (options, args) = parser.parse_args(args)
   # --force is implied.
   options.force = True
@@ -1804,7 +1820,7 @@ def CMDhookinfo(parser, args):
   if not client:
     raise gclient_utils.Error('client not configured; see \'gclient config\'')
   client.RunOnDeps(None, [])
-  print '; '.join(' '.join(hook) for hook in client.GetHooks(options))
+  print('; '.join(' '.join(hook) for hook in client.GetHooks(options)))
   return 0
 
 
@@ -1820,10 +1836,10 @@ def CMDverify(parser, args):
     bad_deps = dep.findDepsFromNotAllowedHosts()
     if not bad_deps:
       continue
-    print "There are deps from not allowed hosts in file %s" % dep.deps_file
+    print("There are deps from not allowed hosts in file %s" % dep.deps_file)
     for bad_dep in bad_deps:
-      print "\t%s at %s" % (bad_dep.name, bad_dep.url)
-    print "allowed_hosts:", ', '.join(dep.allowed_hosts)
+      print("\t%s at %s" % (bad_dep.name, bad_dep.url))
+    print("allowed_hosts:", ', '.join(dep.allowed_hosts))
     sys.stdout.flush()
     raise gclient_utils.Error(
         'dependencies from disallowed hosts; check your DEPS file.')
@@ -1945,25 +1961,27 @@ def main(argv):
   """Doesn't parse the arguments here, just find the right subcommand to
   execute."""
   if sys.hexversion < 0x02060000:
-    print >> sys.stderr, (
+    print(
         '\nYour python version %s is unsupported, please upgrade.\n' %
-        sys.version.split(' ', 1)[0])
+        sys.version.split(' ', 1)[0],
+        file=sys.stderr)
     return 2
   if not sys.executable:
-    print >> sys.stderr, (
-        '\nPython cannot find the location of it\'s own executable.\n')
+    print(
+        '\nPython cannot find the location of it\'s own executable.\n',
+        file=sys.stderr)
     return 2
   fix_encoding.fix_encoding()
   disable_buffering()
-  colorama.init()
+  setup_color.init()
   dispatcher = subcommand.CommandDispatcher(__name__)
   try:
     return dispatcher.execute(OptionParser(), argv)
   except KeyboardInterrupt:
     gclient_utils.GClientChildren.KillAllRemainingChildren()
     raise
-  except (gclient_utils.Error, subprocess2.CalledProcessError), e:
-    print >> sys.stderr, 'Error: %s' % str(e)
+  except (gclient_utils.Error, subprocess2.CalledProcessError) as e:
+    print('Error: %s' % str(e), file=sys.stderr)
     return 1
   finally:
     gclient_utils.PrintWarnings()

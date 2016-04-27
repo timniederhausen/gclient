@@ -28,6 +28,10 @@ GSUTIL_DEFAULT_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), 'gsutil.py')
 
 
+class NoUsableRevError(gclient_utils.Error):
+  """Raised if requested revision isn't found in checkout."""
+
+
 class DiffFiltererWrapper(object):
   """Simple base class which tracks which file is being diffed and
   replaces instances of its file name in the original and
@@ -278,6 +282,27 @@ class GitWrapper(SCMWrapper):
           os.remove(disabled_hook_path)
         os.rename(os.path.join(hook_dir, f), disabled_hook_path)
 
+  def _maybe_break_locks(self, options):
+    """This removes all .lock files from this repo's .git directory, if the
+    user passed the --break_repo_locks command line flag.
+
+    In particular, this will cleanup index.lock files, as well as ref lock
+    files.
+    """
+    if options.break_repo_locks:
+      git_dir = os.path.join(self.checkout_path, '.git')
+      for path, _, filenames in os.walk(git_dir):
+        for filename in filenames:
+          if filename.endswith('.lock'):
+            to_break = os.path.join(path, filename)
+            self.Print('breaking lock: %s' % (to_break,))
+            try:
+              os.remove(to_break)
+            except OSError as ex:
+              self.Print('FAILED to break lock: %s: %s' % (to_break, ex))
+              raise
+
+
   def update(self, options, args, file_list):
     """Runs git to update or transparently checkout the working copy.
 
@@ -378,17 +403,18 @@ class GitWrapper(SCMWrapper):
       self.Print('________ unmanaged solution; skipping %s' % self.relpath)
       return self._Capture(['rev-parse', '--verify', 'HEAD'])
 
-    # See if the url has changed (the unittests use git://foo for the url, let
-    # that through).
+    self._maybe_break_locks(options)
+
+    if mirror:
+      self._UpdateMirror(mirror, options)
+
+    # See if the url has changed.
     current_url = self._Capture(['config', 'remote.%s.url' % self.remote])
     return_early = False
-    # TODO(maruel): Delete url != 'git://foo' since it's just to make the
-    # unit test pass. (and update the comment above)
     # Skip url auto-correction if remote.origin.gclient-auto-fix-url is set.
     # This allows devs to use experimental repos which have a different url
     # but whose branch(s) are the same as official repos.
     if (current_url.rstrip('/') != url.rstrip('/') and
-        url != 'git://foo' and
         subprocess2.capture(
             ['git', 'config', 'remote.%s.gclient-auto-fix-url' % self.remote],
             cwd=self.checkout_path).strip() != 'False'):
@@ -398,8 +424,12 @@ class GitWrapper(SCMWrapper):
         self._CheckClean(rev_str)
       # Switch over to the new upstream
       self._Run(['remote', 'set-url', self.remote, url], options)
+      self._EnsureValidHeadObjectOrCheckout(revision, options, url)
       self._FetchAndReset(revision, file_list, options)
+
       return_early = True
+    else:
+      self._EnsureValidHeadObjectOrCheckout(revision, options, url)
 
     if return_early:
       return self._Capture(['rev-parse', '--verify', 'HEAD'])
@@ -452,7 +482,7 @@ class GitWrapper(SCMWrapper):
       if verbose:
         self.Print(remote_output)
 
-      self._UpdateBranchHeads(options, fetch=True)
+    self._UpdateBranchHeads(options, fetch=True)
 
     # This is a big hammer, debatable if it should even be here...
     if options.force or options.reset:
@@ -463,7 +493,9 @@ class GitWrapper(SCMWrapper):
 
     if current_type == 'detached':
       # case 0
-      self._CheckClean(rev_str)
+      if not options.force:
+        # Don't do this check if nuclear option is on.
+        self._CheckClean(rev_str)
       self._CheckDetachedHead(rev_str, options)
       if self._Capture(['rev-list', '-n', '1', 'HEAD']) == revision:
         self.Print('Up-to-date; skipping checkout.')
@@ -473,7 +505,7 @@ class GitWrapper(SCMWrapper):
         self._Checkout(
             options,
             revision,
-            force=(options.force and options.delete_unversioned_trees),
+            force=(options.force or options.delete_unversioned_trees),
             quiet=True,
         )
       if not printed_path:
@@ -658,7 +690,15 @@ class GitWrapper(SCMWrapper):
       deps_revision = default_rev
     if deps_revision.startswith('refs/heads/'):
       deps_revision = deps_revision.replace('refs/heads/', self.remote + '/')
-    deps_revision = self.GetUsableRev(deps_revision, options)
+    try:
+      deps_revision = self.GetUsableRev(deps_revision, options)
+    except NoUsableRevError as e:
+      # If the DEPS entry's url and hash changed, try to update the origin.
+      # See also http://crbug.com/520067.
+      logging.warn(
+          'Couldn\'t find usable revision, will retrying to update instead: %s',
+          e.message)
+      return self.update(options, [], file_list)
 
     if file_list is not None:
       files = self._Capture(['diff', deps_revision, '--name-only']).split()
@@ -696,7 +736,7 @@ class GitWrapper(SCMWrapper):
     will be called on the source."""
     sha1 = None
     if not os.path.isdir(self.checkout_path):
-      raise gclient_utils.Error(
+      raise NoUsableRevError(
           ( 'We could not find a valid hash for safesync_url response "%s".\n'
             'Safesync URLs with a git checkout currently require the repo to\n'
             'be cloned without a safesync_url before adding the safesync_url.\n'
@@ -730,7 +770,7 @@ class GitWrapper(SCMWrapper):
                  'the closest sane git revision, which is:\n'
                  '  %s\n' % (rev, e.message))
         if not sha1:
-          raise gclient_utils.Error(
+          raise NoUsableRevError(
               ( 'It appears that either your git-svn remote is incorrectly\n'
                 'configured or the revision in your safesync_url is\n'
                 'higher than git-svn remote\'s HEAD as we couldn\'t find a\n'
@@ -746,7 +786,7 @@ class GitWrapper(SCMWrapper):
           sha1 = rev
 
     if not sha1:
-      raise gclient_utils.Error(
+      raise NoUsableRevError(
           ( 'We could not find a valid hash for safesync_url response "%s".\n'
             'Safesync URLs with a git checkout currently require a git-svn\n'
             'remote or a safesync_url that provides git sha1s. Please add a\n'
@@ -767,6 +807,38 @@ class GitWrapper(SCMWrapper):
     staged/restored. Use case: subproject moved from DEPS <-> outer project."""
     return os.path.join(self._root_dir,
                         'old_' + self.relpath.replace(os.sep, '_')) + '.git'
+
+  def _GetMirror(self, url, options):
+    """Get a git_cache.Mirror object for the argument url."""
+    if not git_cache.Mirror.GetCachePath():
+      return None
+    mirror_kwargs = {
+        'print_func': self.filter,
+        'refs': []
+    }
+    if hasattr(options, 'with_branch_heads') and options.with_branch_heads:
+      mirror_kwargs['refs'].append('refs/branch-heads/*')
+    if hasattr(options, 'with_tags') and options.with_tags:
+      mirror_kwargs['refs'].append('refs/tags/*')
+    return git_cache.Mirror(url, **mirror_kwargs)
+
+  @staticmethod
+  def _UpdateMirror(mirror, options):
+    """Update a git mirror by fetching the latest commits from the remote."""
+    if getattr(options, 'shallow', False):
+      # HACK(hinoka): These repositories should be super shallow.
+      if 'flash' in mirror.url:
+        depth = 10
+      else:
+        depth = 10000
+    else:
+      depth = None
+    mirror.populate(verbose=options.verbose,
+                    bootstrap=not getattr(options, 'no_bootstrap', False),
+                    depth=depth,
+                    ignore_lock=getattr(options, 'ignore_locks', False),
+                    lock_timeout=getattr(options, 'lock_timeout', 0))
+    mirror.unlock()
 
   def _Clone(self, revision, url, options):
     """Clone a git repository from the given URL.
@@ -937,6 +1009,29 @@ class GitWrapper(SCMWrapper):
       raise gclient_utils.Error('git version %s < minimum required %s' %
                                 (current_version, min_version))
 
+  def _EnsureValidHeadObjectOrCheckout(self, revision, options, url):
+    # Special case handling if all 3 conditions are met:
+    #   * the mirros have recently changed, but deps destination remains same,
+    #   * the git histories of mirrors are conflicting.
+    #   * git cache is used
+    # This manifests itself in current checkout having invalid HEAD commit on
+    # most git operations. Since git cache is used, just deleted the .git
+    # folder, and re-create it by cloning.
+    try:
+      self._Capture(['rev-list', '-n', '1', 'HEAD'])
+    except subprocess2.CalledProcessError as e:
+      if ('fatal: bad object HEAD' in e.stderr
+          and self.cache_dir and self.cache_dir in url):
+        self.Print((
+          'Likely due to DEPS change with git cache_dir, '
+          'the current commit points to no longer existing object.\n'
+          '%s' % e)
+        )
+        self._DeleteOrMove(options.force)
+        self._Clone(revision, url, options)
+      else:
+        raise
+
   def _IsRebasing(self):
     # Check for any of REBASE-i/REBASE-m/REBASE/AM. Unfortunately git doesn't
     # have a plumbing command to determine whether a rebase is in progress, so
@@ -947,6 +1042,14 @@ class GitWrapper(SCMWrapper):
       os.path.isdir(os.path.join(g, "rebase-apply")))
 
   def _CheckClean(self, rev_str):
+    lockfile = os.path.join(self.checkout_path, ".git", "index.lock")
+    if os.path.exists(lockfile):
+      raise gclient_utils.Error(
+        '\n____ %s%s\n'
+        '\tYour repo is locked, possibly due to a concurrent git process.\n'
+        '\tIf no git executable is running, then clean up %r and try again.\n'
+        % (self.relpath, rev_str, lockfile))
+
     # Make sure the tree is clean; see git-rebase.sh for reference
     try:
       scm.GIT.Capture(['update-index', '--ignore-submodules', '--refresh'],
@@ -1083,7 +1186,7 @@ class SVNWrapper(SCMWrapper):
     'Oh hai! You are using subversion. Chrome infra is eager to get rid of',
     'svn support so please switch to git.',
     'Tracking bug: http://crbug.com/475320',
-    'Request a new git repository at: ',
+    'If you are a project owner, you may request git migration assistance at: ',
     '  https://code.google.com/p/chromium/issues/entry?template=Infra-Git')
 
   def __init__(self, *args, **kwargs):
@@ -1432,7 +1535,7 @@ class SVNWrapper(SCMWrapper):
   def GetUsableRev(self, rev, _options):
     """Verifies the validity of the revision for this repository."""
     if not scm.SVN.IsValidRevision(url='%s@%s' % (self.url, rev)):
-      raise gclient_utils.Error(
+      raise NoUsableRevError(
         ( '%s isn\'t a valid revision. Please check that your safesync_url is\n'
           'correct.') % rev)
     return rev
