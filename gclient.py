@@ -578,11 +578,7 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
 
     # First try to locate the configured deps file.  If it's missing, fallback
     # to DEPS.
-    deps_files = []
-    if self.deps_file:
-      deps_files.append(self.deps_file)
-    if 'DEPS' not in deps_files:
-      deps_files.append('DEPS')
+    deps_files = [self.deps_file]
     for deps_file in deps_files:
       filepath = os.path.join(self.root.root_dir, self.name, deps_file)
       if os.path.isfile(filepath):
@@ -1153,7 +1149,7 @@ class GClient(Dependency):
     # are processed.
     self._recursion_limit = 2
     Dependency.__init__(self, None, '', None, None, True, None, options.custom_vars, None,
-                        'DEPS', True)
+                        options.deps_file, True)
     self._options = options
     if options.deps_os:
       enforced_os = options.deps_os.split(',')
@@ -1865,6 +1861,9 @@ class OptionParser(optparse.OptionParser):
       jobs = 1
 
     self.add_option(
+        '-d', '--deps_file', default='DEPS',
+        help='Name of the root DEPS file')
+    self.add_option(
         '-j', '--jobs', default=jobs, type='int',
         help='Specify how many SCM commands can run in parallel; defaults to '
              '%default on this machine')
@@ -1896,13 +1895,6 @@ class OptionParser(optparse.OptionParser):
     logging.basicConfig(
         level=levels[min(options.verbose, len(levels) - 1)],
         format='%(module)s(%(lineno)d) %(funcName)s:%(message)s')
-    if options.config_filename and options.spec:
-      self.error('Cannot specifiy both --gclientfile and --spec')
-    if (options.config_filename and
-        options.config_filename != os.path.basename(options.config_filename)):
-      self.error('--gclientfile target must be a filename, not a path')
-    if not options.config_filename:
-      options.config_filename = self.gclientfile_default
 
     custom_vars = {}
     for name, value in options.custom_vars:
@@ -1911,7 +1903,7 @@ class OptionParser(optparse.OptionParser):
       custom_vars.merge(self.load_environment(options.environment_filename))
     options.custom_vars = custom_vars
 
-    options.entries_filename = options.config_filename + '_entries'
+    options.entries_filename = self.gclientfile_default + '_entries'
     if options.jobs < 1:
       self.error('--jobs must be 1 or higher')
 
