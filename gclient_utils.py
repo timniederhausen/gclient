@@ -5,9 +5,12 @@
 """Generic utils."""
 
 import codecs
+import collections
+import contextlib
 import cStringIO
 import datetime
 import logging
+import operator
 import os
 import pipes
 import platform
@@ -89,6 +92,11 @@ def IsGitSha(revision):
   return re.match('^[a-fA-F0-9]{6,40}$', revision) is not None
 
 
+def IsFullGitSha(revision):
+  """Returns true if the given string is a valid hex-encoded full sha"""
+  return re.match('^[a-fA-F0-9]{40}$', revision) is not None
+
+
 def IsDateRevision(revision):
   """Returns true if the given revision is of the form "{ ... }"."""
   return bool(revision and re.match(r'^\{.+\}$', str(revision)))
@@ -143,6 +151,16 @@ def FileWrite(filename, content, mode='w'):
     f.write(content)
 
 
+@contextlib.contextmanager
+def temporary_directory(**kwargs):
+  tdir = tempfile.mkdtemp(**kwargs)
+  try:
+    yield tdir
+  finally:
+    if tdir:
+      rmtree(tdir)
+
+
 def safe_rename(old, new):
   """Renames a file reliably.
 
@@ -179,9 +197,8 @@ def rmtree(path):
   Recursively removes a directory, even if it's marked read-only.
 
   shutil.rmtree() doesn't work on Windows if any of the files or directories
-  are read-only, which svn repositories and some .svn files are.  We need to
-  be able to force the files to be writable (i.e., deletable) as we traverse
-  the tree.
+  are read-only. We need to be able to force the files to be writable (i.e.,
+  deletable) as we traverse the tree.
 
   Even with all this, Windows still sometimes fails to delete a file, citing
   a permission error (maybe something to do with antivirus scans or disk
@@ -494,8 +511,9 @@ def CheckCallAndFilter(args, stdout=None, filter_fn=None,
 
     # Also, we need to forward stdout to prevent weird re-ordering of output.
     # This has to be done on a per byte basis to make sure it is not buffered:
-    # normally buffering is done for each line, but if svn requests input, no
-    # end-of-line character is output after the prompt and it would not show up.
+    # normally buffering is done for each line, but if the process requests
+    # input, no end-of-line character is output after the prompt and it would
+    # not show up.
     try:
       in_byte = kid.stdout.read(1)
       if in_byte:
@@ -600,8 +618,9 @@ def FindGclientRoot(from_dir, filename='.gclient'):
       # might have failed. In that case, we cannot verify that the .gclient
       # is the one we want to use. In order to not to cause too much trouble,
       # just issue a warning and return the path anyway.
-      print >> sys.stderr, ("%s file in parent directory %s might not be the "
-          "file you want to use" % (filename, path))
+      print >> sys.stderr, ("%s missing, %s file in parent directory %s might "
+          "not be the file you want to use." %
+          (entries_filename, filename, path))
       return path
     scope = {}
     try:
@@ -671,7 +690,9 @@ def GetPrimarySolutionPath():
     # checkout.
     top_dir = [os.getcwd()]
     def filter_fn(line):
-      top_dir[0] = os.path.normpath(line.rstrip('\n'))
+      repo_root_path = os.path.normpath(line.rstrip('\n'))
+      if os.path.exists(repo_root_path):
+        top_dir[0] = repo_root_path
     try:
       CheckCallAndFilter(["git", "rev-parse", "--show-toplevel"],
                          print_stdout=False, filter_fn=filter_fn)
@@ -784,6 +805,7 @@ class WorkItem(object):
     self._name = name
     self.outbuf = cStringIO.StringIO()
     self.start = self.finish = None
+    self.resources = []  # List of resources this work item requires.
 
   def run(self, work_queue):
     """work_queue is passed as keyword argument so it should be
@@ -799,8 +821,7 @@ class ExecutionQueue(object):
   """Runs a set of WorkItem that have interdependencies and were WorkItem are
   added as they are processed.
 
-  In gclient's case, Dependencies sometime needs to be run out of order due to
-  From() keyword. This class manages that all the required dependencies are run
+  This class manages that all the required dependencies are run
   before running each one.
 
   Methods of this class are thread safe.
@@ -869,6 +890,15 @@ class ExecutionQueue(object):
 ----------------------------------------""" % (
     task.name, comment, elapsed, task.outbuf.getvalue().strip())
 
+  def _is_conflict(self, job):
+    """Checks to see if a job will conflict with another running job."""
+    for running_job in self.running:
+      for used_resource in running_job.item.resources:
+        logging.debug('Checking resource %s' % used_resource)
+        if used_resource in job.resources:
+          return True
+    return False
+
   def flush(self, *args, **kwargs):
     """Runs all enqueued items until all are executed."""
     kwargs['work_queue'] = self
@@ -892,9 +922,10 @@ class ExecutionQueue(object):
             # Verify its requirements.
             if (self.ignore_requirements or
                 not (set(self.queued[i].requirements) - set(self.ran))):
-              # Start one work item: all its requirements are satisfied.
-              self._run_one_task(self.queued.pop(i), args, kwargs)
-              break
+              if not self._is_conflict(self.queued[i]):
+                # Start one work item: all its requirements are satisfied.
+                self._run_one_task(self.queued.pop(i), args, kwargs)
+                break
           else:
             # Couldn't find an item that could run. Break out the outher loop.
             break
@@ -1043,11 +1074,11 @@ class ExecutionQueue(object):
           work_queue.ready_cond.release()
 
 
-def GetEditor(git, git_editor=None):
+def GetEditor(git_editor=None):
   """Returns the most plausible editor to use.
 
   In order of preference:
-  - GIT_EDITOR/SVN_EDITOR environment variable
+  - GIT_EDITOR environment variable
   - core.editor git configuration variable (if supplied by git-cl)
   - VISUAL environment variable
   - EDITOR environment variable
@@ -1055,14 +1086,8 @@ def GetEditor(git, git_editor=None):
 
   In the case of git-cl, this matches git's behaviour, except that it does not
   include dumb terminal detection.
-
-  In the case of gcl, this matches svn's behaviour, except that it does not
-  accept a command-line flag or check the editor-cmd configuration variable.
   """
-  if git:
-    editor = os.environ.get('GIT_EDITOR') or git_editor
-  else:
-    editor = os.environ.get('SVN_EDITOR')
+  editor = os.environ.get('GIT_EDITOR') or git_editor
   if not editor:
     editor = os.environ.get('VISUAL')
   if not editor:
@@ -1092,7 +1117,7 @@ def RunEditor(content, git, git_editor=None):
   fileobj.close()
 
   try:
-    editor = GetEditor(git, git_editor=git_editor)
+    editor = GetEditor(git_editor=git_editor)
     if not editor:
       return None
     cmd = '%s %s' % (editor, filename)
@@ -1162,9 +1187,9 @@ def NumLocalCpus():
     try:
       import multiprocessing
       return multiprocessing.cpu_count()
-    except NotImplementedError:  # pylint: disable=W0702
+    except NotImplementedError:  # pylint: disable=bare-except
       # (UNIX) Query 'os.sysconf'.
-      # pylint: disable=E1101
+      # pylint: disable=no-member
       if hasattr(os, 'sysconf') and 'SC_NPROCESSORS_ONLN' in os.sysconf_names:
         return int(os.sysconf('SC_NPROCESSORS_ONLN'))
 
@@ -1236,3 +1261,67 @@ def FindExecutable(executable):
         if os.path.isfile(alt_target) and os.access(alt_target, os.X_OK):
           return alt_target
   return None
+
+
+def freeze(obj):
+  """Takes a generic object ``obj``, and returns an immutable version of it.
+
+  Supported types:
+    * dict / OrderedDict -> FrozenDict
+    * list -> tuple
+    * set -> frozenset
+    * any object with a working __hash__ implementation (assumes that hashable
+      means immutable)
+
+  Will raise TypeError if you pass an object which is not hashable.
+  """
+  if isinstance(obj, dict):
+    return FrozenDict((freeze(k), freeze(v)) for k, v in obj.iteritems())
+  elif isinstance(obj, (list, tuple)):
+    return tuple(freeze(i) for i in obj)
+  elif isinstance(obj, set):
+    return frozenset(freeze(i) for i in obj)
+  else:
+    hash(obj)
+    return obj
+
+
+class FrozenDict(collections.Mapping):
+  """An immutable OrderedDict.
+
+  Modified From: http://stackoverflow.com/a/2704866
+  """
+  def __init__(self, *args, **kwargs):
+    self._d = collections.OrderedDict(*args, **kwargs)
+
+    # Calculate the hash immediately so that we know all the items are
+    # hashable too.
+    self._hash = reduce(operator.xor,
+                        (hash(i) for i in enumerate(self._d.iteritems())), 0)
+
+  def __eq__(self, other):
+    if not isinstance(other, collections.Mapping):
+      return NotImplemented
+    if self is other:
+      return True
+    if len(self) != len(other):
+      return False
+    for k, v in self.iteritems():
+      if k not in other or other[k] != v:
+        return False
+    return True
+
+  def __iter__(self):
+    return iter(self._d)
+
+  def __len__(self):
+    return len(self._d)
+
+  def __getitem__(self, key):
+    return self._d[key]
+
+  def __hash__(self):
+    return self._hash
+
+  def __repr__(self):
+    return 'FrozenDict(%r)' % (self._d.items(),)
