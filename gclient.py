@@ -429,7 +429,7 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
     # want: self is a 2nd level node. 3nd level node wouldn't need this since
     # they already have their parent as a requirement.
     if self.parent and self.parent.parent and not self.parent.parent.parent:
-      requirements |= set(i.name for i in self.root.dependencies if i.name)
+      requirements |= set(i.name for i in self.root.dependencies if i.name and i.should_process)
 
     if self.name:
       requirements |= set(
