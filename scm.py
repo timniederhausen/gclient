@@ -4,24 +4,21 @@
 
 """SCM-specific utility classes."""
 
-import cStringIO
 import glob
-import logging
+import io
 import os
 import platform
 import re
 import sys
-import tempfile
-import time
-from xml.etree import ElementTree
 
 import gclient_utils
 import subprocess2
 
 
 def ValidateEmail(email):
-  return (re.match(r"^[a-zA-Z0-9._%-+]+@[a-zA-Z0-9._%-]+.[a-zA-Z]{2,6}$", email)
-          is not None)
+  return (
+      re.match(r"^[a-zA-Z0-9._%\-+]+@[a-zA-Z0-9._%-]+.[a-zA-Z]{2,6}$", email)
+      is not None)
 
 
 def GetCasedPath(path):
@@ -50,7 +47,7 @@ def GenFakeDiff(filename):
   filename = filename.replace(os.sep, '/')
   nb_lines = len(file_content)
   # We need to use / since patch on unix will fail otherwise.
-  data = cStringIO.StringIO()
+  data = io.StringIO()
   data.write("Index: %s\n" % filename)
   data.write('=' * 67 + '\n')
   # Note: Should we use /dev/null instead?
@@ -116,8 +113,8 @@ class GIT(object):
   def Capture(args, cwd, strip_out=True, **kwargs):
     env = GIT.ApplyEnvVars(kwargs)
     output = subprocess2.check_output(
-        ['git'] + args,
-        cwd=cwd, stderr=subprocess2.PIPE, env=env, **kwargs)
+        ['git'] + args, cwd=cwd, stderr=subprocess2.PIPE, env=env,
+        **kwargs).decode('utf-8', 'replace')
     return output.strip() if strip_out else output
 
   @staticmethod
@@ -131,8 +128,8 @@ class GIT(object):
       upstream_branch = GIT.GetUpstreamBranch(cwd)
       if upstream_branch is None:
         raise gclient_utils.Error('Cannot determine upstream branch')
-    command = ['diff', '--name-status', '--no-renames',
-               '-r', '%s...' % upstream_branch]
+    command = ['-c', 'core.quotePath=false', 'diff',
+               '--name-status', '--no-renames', '-r', '%s...' % upstream_branch]
     if not files:
       pass
     elif isinstance(files, basestring):
@@ -146,7 +143,7 @@ class GIT(object):
         # 3-way merges can cause the status can be 'MMM' instead of 'M'. This
         # can happen when the user has 2 local branches and he diffs between
         # these 2 branches instead diffing to upstream.
-        m = re.match('^(\w)+\t(.+)$', statusline)
+        m = re.match(r'^(\w)+\t(.+)$', statusline)
         if not m:
           raise gclient_utils.Error(
               'status currently unsupported: %s' % statusline)
@@ -225,7 +222,7 @@ class GIT(object):
     return remote, upstream_branch
 
   @staticmethod
-  def RefToRemoteRef(ref, remote=None):
+  def RefToRemoteRef(ref, remote):
     """Convert a checkout ref to the equivalent remote ref.
 
     Returns:
@@ -239,10 +236,24 @@ class GIT(object):
     m = re.match('^(refs/(remotes/)?)?branch-heads/', ref or '')
     if m:
       return ('refs/remotes/branch-heads/', ref.replace(m.group(0), ''))
-    if remote:
-      m = re.match('^((refs/)?remotes/)?%s/|(refs/)?heads/' % remote, ref or '')
-      if m:
-        return ('refs/remotes/%s/' % remote, ref.replace(m.group(0), ''))
+
+    m = re.match('^((refs/)?remotes/)?%s/|(refs/)?heads/' % remote, ref or '')
+    if m:
+      return ('refs/remotes/%s/' % remote, ref.replace(m.group(0), ''))
+
+    return None
+
+  @staticmethod
+  def RemoteRefToRef(ref, remote):
+    assert remote, 'A remote must be given'
+    if not ref or not ref.startswith('refs/'):
+      return None
+    if not ref.startswith('refs/remotes/'):
+      return ref
+    if ref.startswith('refs/remotes/branch-heads/'):
+      return 'refs' + ref[len('refs/remotes'):]
+    if ref.startswith('refs/remotes/%s/' % remote):
+      return 'refs/heads' + ref[len('refs/remotes/%s' % remote):]
     return None
 
   @staticmethod
@@ -254,6 +265,15 @@ class GIT(object):
       if remote_ref:
         upstream_branch = ''.join(remote_ref)
     return upstream_branch
+
+  @staticmethod
+  def IsAncestor(cwd, maybe_ancestor, ref):
+    """Verifies if |maybe_ancestor| is an ancestor of |ref|."""
+    try:
+      GIT.Capture(['merge-base', '--is-ancestor', maybe_ancestor, ref], cwd=cwd)
+      return True
+    except subprocess2.CalledProcessError:
+      return False
 
   @staticmethod
   def GetOldContents(cwd, filename, branch=None):
@@ -277,7 +297,8 @@ class GIT(object):
     files, usually in the prospect to apply the patch for a try job."""
     if not branch:
       branch = GIT.GetUpstreamBranch(cwd)
-    command = ['diff', '-p', '--no-color', '--no-prefix', '--no-ext-diff',
+    command = ['-c', 'core.quotePath=false', 'diff',
+               '-p', '--no-color', '--no-prefix', '--no-ext-diff',
                branch + "..." + branch_head]
     if full_move:
       command.append('--no-renames')
@@ -300,7 +321,8 @@ class GIT(object):
     """Returns the list of modified files between two branches."""
     if not branch:
       branch = GIT.GetUpstreamBranch(cwd)
-    command = ['diff', '--name-only', branch + "..." + branch_head]
+    command = ['-c', 'core.quotePath=false', 'diff',
+               '--name-only', branch + "..." + branch_head]
     return GIT.Capture(command, cwd=cwd).splitlines(False)
 
   @staticmethod
@@ -343,20 +365,16 @@ class GIT(object):
 
     sha_only: Fail unless rev is a sha hash.
     """
-    # 'git rev-parse foo' where foo is *any* 40 character hex string will return
-    # the string and return code 0. So strip one character to force 'git
-    # rev-parse' to do a hash table look-up and returns 128 if the hash is not
-    # present.
-    lookup_rev = rev
-    if re.match(r'^[0-9a-fA-F]{40}$', rev):
-      lookup_rev = rev[:-1]
+    if sys.platform.startswith('win'):
+      # Windows .bat scripts use ^ as escape sequence, which means we have to
+      # escape it with itself for every .bat invocation.
+      needle = '%s^^^^{commit}' % rev
+    else:
+      needle = '%s^{commit}' % rev
     try:
-      sha = GIT.Capture(['rev-parse', lookup_rev], cwd=cwd).lower()
-      if lookup_rev != rev:
-        # Make sure we get the original 40 chars back.
-        return rev.lower() == sha
+      sha = GIT.Capture(['rev-parse', '--verify', needle], cwd=cwd)
       if sha_only:
-        return sha.startswith(rev.lower())
+        return sha == rev.lower()
       return True
     except subprocess2.CalledProcessError:
       return False
@@ -368,7 +386,7 @@ class GIT(object):
       current_version = cls.Capture(['--version'], '.')
       matched = re.search(r'version ([0-9\.]+)', current_version)
       cls.current_version = matched.group(1)
-    current_version_list = map(only_int, cls.current_version.split('.'))
+    current_version_list = list(map(only_int, cls.current_version.split('.')))
     for min_ver in map(int, min_version.split('.')):
       ver = current_version_list.pop(0)
       if ver < min_ver:
