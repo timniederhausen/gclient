@@ -70,12 +70,13 @@
 #
 # Specifying a target CPU
 #   To specify a target CPU, the variables target_cpu and target_cpu_only
-#   are available and are analagous to target_os and target_os_only.
+#   are available and are analogous to target_os and target_os_only.
 
 from __future__ import print_function
 
 __version__ = '0.7'
 
+import collections
 import copy
 import json
 import logging
@@ -97,6 +98,7 @@ import detect_host_arch
 import fix_encoding
 import gclient_eval
 import gclient_scm
+import gclient_paths
 import gclient_utils
 from third_party.repo.progress import Progress
 import subcommand
@@ -109,6 +111,7 @@ from third_party import six
 if six.PY3:
   # pylint: disable=redefined-builtin
   basestring = str
+
 
 DEPOT_TOOLS_DIR = os.path.dirname(os.path.abspath(os.path.realpath(__file__)))
 
@@ -381,7 +384,7 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
     self._file_list = []
     # List of host names from which dependencies are allowed.
     # Default is an empty set, meaning unspecified in DEPS file, and hence all
-    # hosts will be allowed. Non-empty set means whitelist of hosts.
+    # hosts will be allowed. Non-empty set means allowlist of hosts.
     # allowed_hosts var is scoped to its DEPS file, and so it isn't recursive.
     self._allowed_hosts = frozenset()
     self._gn_args_from = None
@@ -404,6 +407,8 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
     # The actual revision we ended up getting, or None if that information is
     # unavailable
     self._got_revision = None
+    # Whether this dependency should use relative paths.
+    self._use_relative_paths = False
 
     # recursedeps is a mutable value that selectively overrides the default
     # 'no recursion' setting on a dep-by-dep basis.
@@ -435,28 +440,45 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
       logging.info('Dependency(%s)._OverrideUrl(%s) -> %s', self._name,
                    self.url, parsed_url)
       self.set_url(parsed_url)
+      return
 
-    elif isinstance(self.url, basestring):
-      parsed_url = urlparse.urlparse(self.url)
-      if (not parsed_url[0] and
-          not re.match(r'^\w+\@[\w\.-]+\:[\w\/]+', parsed_url[2])):
-        path = parsed_url[2]
-        if not path.startswith('/'):
-          raise gclient_utils.Error(
-              'relative DEPS entry \'%s\' must begin with a slash' % self.url)
-        # A relative url. Get the parent url, strip from the last '/'
-        # (equivalent to unix basename), and append the relative url.
-        parent_url = self.parent.url
-        parsed_url = parent_url[:parent_url.rfind('/')] + self.url
-        logging.info('Dependency(%s)._OverrideUrl(%s) -> %s', self.name,
-                     self.url, parsed_url)
-        self.set_url(parsed_url)
-
-    elif self.url is None:
+    if self.url is None:
       logging.info('Dependency(%s)._OverrideUrl(None) -> None', self._name)
+      return
 
-    else:
+    if not isinstance(self.url, basestring):
       raise gclient_utils.Error('Unknown url type')
+
+    # self.url is a local path
+    path, at, rev = self.url.partition('@')
+    if os.path.isdir(path):
+      return
+
+    # self.url is a URL
+    parsed_url = urlparse.urlparse(self.url)
+    if parsed_url[0] or re.match(r'^\w+\@[\w\.-]+\:[\w\/]+', parsed_url[2]):
+      return
+
+    # self.url is relative to the parent's URL.
+    if not path.startswith('/'):
+      raise gclient_utils.Error(
+          'relative DEPS entry \'%s\' must begin with a slash' % self.url)
+
+    parent_url = self.parent.url
+    parent_path = self.parent.url.split('@')[0]
+    if os.path.isdir(parent_path):
+      # Parent's URL is a local path. Get parent's URL dirname and append
+      # self.url.
+      parent_path = os.path.dirname(parent_path)
+      parsed_url = parent_path + path.replace('/', os.sep) + at + rev
+    else:
+      # Parent's URL is a URL. Get parent's URL, strip from the last '/'
+      # (equivalent to unix dirname) and append self.url.
+      parsed_url = parent_url[:parent_url.rfind('/')] + self.url
+
+    logging.info('Dependency(%s)._OverrideUrl(%s) -> %s', self.name,
+                 self.url, parsed_url)
+    self.set_url(parsed_url)
 
   def PinToActualRevision(self):
     """Updates self.url to the revision checked out on disk."""
@@ -498,7 +520,7 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
     # thus unsorted, while the .gclient format is a list thus sorted.
     #
     # Interestingly enough, the following condition only works in the case we
-    # want: self is a 2nd level node. 3nd level node wouldn't need this since
+    # want: self is a 2nd level node. 3rd level node wouldn't need this since
     # they already have their parent as a requirement.
     if self.parent and self.parent.parent and not self.parent.parent.parent:
       requirements |= set(i.name for i in self.root.dependencies if i.name and i.should_process)
@@ -549,7 +571,7 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
               self.url))
       # In theory we could keep it as a shadow of the other one. In
       # practice, simply ignore it.
-      logging.warn('Won\'t process duplicate dependency %s' % sibling)
+      logging.warning("Won't process duplicate dependency %s" % sibling)
       return False
     return True
 
@@ -560,7 +582,7 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
 
     # If a line is in custom_deps, but not in the solution, we want to append
     # this line to the solution.
-    for dep_name, dep_info in six.iteritems(self.custom_deps):
+    for dep_name, dep_info in self.custom_deps.items():
       if dep_name not in deps:
         deps[dep_name] = {'url': dep_info, 'dep_type': 'git'}
 
@@ -571,13 +593,13 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
     # recursively included by "src/ios_foo/DEPS" should also require
     # "checkout_ios=True".
     if self.condition:
-      for value in six.itervalues(deps):
+      for value in deps.values():
         gclient_eval.UpdateCondition(value, 'and', self.condition)
 
     if rel_prefix:
       logging.warning('use_relative_paths enabled.')
       rel_deps = {}
-      for d, url in six.iteritems(deps):
+      for d, url in deps.items():
         # normpath is required to allow DEPS to use .. in their
         # dependency local path.
         rel_deps[os.path.normpath(os.path.join(rel_prefix, d))] = url
@@ -589,7 +611,7 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
   def _deps_to_objects(self, deps, use_relative_paths):
     """Convert a deps dict to a dict of Dependency objects."""
     deps_to_add = []
-    for name, dep_value in six.iteritems(deps):
+    for name, dep_value in deps.items():
       should_process = self.should_process
       if dep_value is None:
         continue
@@ -695,7 +717,7 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
 
     self._vars = local_scope.get('vars', {})
     if self.parent:
-      for key, value in six.iteritems(self.parent.get_vars()):
+      for key, value in self.parent.get_vars().items():
         if key in self._vars:
           self._vars[key] = value
     # Since we heavily post-process things, freeze ones which should
@@ -710,9 +732,9 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
     # (and therefore set self.relative on this Dependency object), then we
     # want to modify the deps and recursedeps by prepending the parent
     # directory of this dependency.
-    use_relative_paths = local_scope.get('use_relative_paths', False)
+    self._use_relative_paths = local_scope.get('use_relative_paths', False)
     rel_prefix = None
-    if use_relative_paths:
+    if self._use_relative_paths:
       rel_prefix = self.name
     elif self._relative:
       rel_prefix = os.path.dirname(self.name)
@@ -732,7 +754,7 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
       if rel_prefix:
         logging.warning('Updating recursedeps by prepending %s.', rel_prefix)
         rel_deps = {}
-        for depname, options in six.iteritems(self.recursedeps):
+        for depname, options in self.recursedeps.items():
           rel_deps[
               os.path.normpath(os.path.join(rel_prefix, depname))] = options
         self.recursedeps = rel_deps
@@ -747,16 +769,15 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
 
     deps = local_scope.get('deps', {})
     deps_to_add = self._deps_to_objects(
-        self._postprocess_deps(deps, rel_prefix), use_relative_paths)
+        self._postprocess_deps(deps, rel_prefix), self._use_relative_paths)
 
     # compute which working directory should be used for hooks
-    use_relative_hooks = local_scope.get('use_relative_hooks', False)
+    if local_scope.get('use_relative_hooks', False):
+      print('use_relative_hooks is deprecated, please remove it from DEPS. ' +
+            '(it was merged in use_relative_paths)', file=sys.stderr)
+
     hooks_cwd = self.root.root_dir
-    if use_relative_hooks:
-      if not use_relative_paths:
-        raise gclient_utils.Error(
-            'ParseDepsFile(%s): use_relative_hooks must be used with '
-            'use_relative_paths' % self.name)
+    if self._use_relative_paths:
       hooks_cwd = os.path.join(hooks_cwd, self.name)
       logging.warning('Updating hook base working directory to %s.',
                       hooks_cwd)
@@ -990,11 +1011,19 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
     variables = self.get_vars()
     for arg in self._gn_args:
       value = variables[arg]
-      if isinstance(value, basestring):
+      if isinstance(value, gclient_eval.ConstantString):
+        value = value.value
+      elif isinstance(value, basestring):
         value = gclient_eval.EvaluateCondition(value, variables)
       lines.append('%s = %s' % (arg, ToGNString(value)))
-    with open(os.path.join(self.root.root_dir, self._gn_args_file), 'w') as f:
-      f.write('\n'.join(lines))
+
+    # When use_relative_paths is set, gn_args_file is relative to this DEPS
+    path_prefix = self.root.root_dir
+    if self._use_relative_paths:
+      path_prefix = os.path.join(path_prefix, self.name)
+
+    with open(os.path.join(path_prefix, self._gn_args_file), 'wb') as f:
+      f.write('\n'.join(lines).encode('utf-8', 'replace'))
 
   @gclient_utils.lockedmethod
   def _run_is_done(self, file_list):
@@ -1212,11 +1241,11 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
     result = {}
     result.update(self._vars)
     if self.parent:
-      parent_vars = self.parent.get_vars()
-      result.update(parent_vars)
+      merge_vars(result, self.parent.get_vars())
     # Provide some built-in variables.
     result.update(self.get_builtin_vars())
-    result.update(self.custom_vars or {})
+    merge_vars(result, self.custom_vars)
+
     return result
 
 
@@ -1228,6 +1257,20 @@ _PLATFORM_MAPPING = {
   'win32': 'win',
   'aix6': 'aix',
 }
+
+
+def merge_vars(result, new_vars):
+  for k, v in new_vars.items():
+    if k in result:
+      if isinstance(result[k], gclient_eval.ConstantString):
+        if isinstance(v, gclient_eval.ConstantString):
+          result[k] = v
+        else:
+          result[k].value = v
+      else:
+        result[k] = v
+    else:
+      result[k] = v
 
 
 def _detect_host_os():
@@ -1393,7 +1436,7 @@ class GClient(GitDependency):
     full_entries = [os.path.join(self.root_dir, e.replace('/', os.path.sep))
                     for e in entries]
 
-    for entry, prev_url in six.iteritems(self._ReadEntries()):
+    for entry, prev_url in self._ReadEntries().items():
       if not prev_url:
         # entry must have been overridden via .gclient custom_deps
         continue
@@ -1480,9 +1523,16 @@ class GClient(GitDependency):
                   should_recurse=False,
                   relative=None,
                   condition=None))
-          print('\nWARNING: \'%s\' is no longer part of this client.\n'
-                'It is recommended that you manually remove it or use '
-                '\'gclient sync -D\' next time.' % entry_fixed)
+          if modified_files and self._options.delete_unversioned_trees:
+            print('\nWARNING: \'%s\' is no longer part of this client.\n'
+                  'Despite running \'gclient sync -D\' no action was taken '
+                  'as there are modifications.\nIt is recommended you revert '
+                  'all changes or run \'gclient sync -D --force\' next '
+                  'time.' % entry_fixed)
+          else:
+            print('\nWARNING: \'%s\' is no longer part of this client.\n'
+                  'It is recommended that you manually remove it or use '
+                  '\'gclient sync -D\' next time.' % entry_fixed)
         else:
           # Delete the entry
           print('\n________ deleting \'%s\' in \'%s\'' % (
@@ -1539,7 +1589,7 @@ class GClient(GitDependency):
           'The following --patch-ref flags were not used. Please fix it:\n%s' %
           ('\n'.join(
               patch_repo + '@' + patch_ref
-              for patch_repo, patch_ref in six.iteritems(patch_refs))))
+              for patch_repo, patch_ref in patch_refs.items())))
 
     # Once all the dependencies have been processed, it's now safe to write
     # out the gn_args_file and run the hooks.
@@ -1626,7 +1676,7 @@ class GClient(GitDependency):
                 'url': rev.split('@')[0] if rev else None,
                 'rev': rev.split('@')[1] if rev and '@' in rev else None,
             }
-            for name, rev in six.iteritems(entries)
+            for name, rev in entries.items()
         }
         if self._options.output_json == '-':
           print(json.dumps(json_output, indent=2, separators=(',', ': ')))
@@ -1905,7 +1955,7 @@ class Flattener(object):
       self._flatten_dep(solution)
 
     if pin_all_deps:
-      for dep in six.itervalues(self._deps):
+      for dep in self._deps.values():
         self._pin_dep(dep)
 
     def add_deps_file(dep):
@@ -1923,7 +1973,7 @@ class Flattener(object):
           return
       assert dep.url
       self._deps_files.add((dep.url, deps_file, dep.hierarchy_data()))
-    for dep in six.itervalues(self._deps):
+    for dep in self._deps.values():
       add_deps_file(dep)
 
     gn_args_dep = self._deps.get(self._client.dependencies[0]._gn_args_from,
@@ -1966,7 +2016,7 @@ class Flattener(object):
     # Only include vars explicitly listed in the DEPS files or gclient solution,
     # not automatic, local overrides (i.e. not all of dep.get_vars()).
     hierarchy = dep.hierarchy(include_url=False)
-    for key, value in six.iteritems(dep._vars):
+    for key, value in dep._vars.items():
       # Make sure there are no conflicting variables. It is fine however
       # to use same variable name, as long as the value is consistent.
       assert key not in self._vars or self._vars[key][1] == value, (
@@ -1974,7 +2024,7 @@ class Flattener(object):
           dep.name, key, value, self._vars[key][1]))
       self._vars[key] = (hierarchy, value)
     # Override explicit custom variables.
-    for key, value in six.iteritems(dep.custom_vars):
+    for key, value in dep.custom_vars.items():
       # Do custom_vars that don't correspond to DEPS vars ever make sense? DEPS
       # conditionals shouldn't be using vars that aren't also defined in the
       # DEPS (presubmit actually disallows this), so any new custom_var must be
@@ -2126,7 +2176,7 @@ def _HooksOsToLines(hooks_os):
   if not hooks_os:
     return []
   s = ['hooks_os = {']
-  for hook_os, os_hooks in six.iteritems(hooks_os):
+  for hook_os, os_hooks in hooks_os.items():
     s.append('  "%s": [' % hook_os)
     for dep, hook in os_hooks:
       s.extend([
@@ -2352,27 +2402,15 @@ def CMDsync(parser, args):
   parser.add_option('--no_bootstrap', '--no-bootstrap',
                     action='store_true',
                     help='Don\'t bootstrap from Google Storage.')
-  parser.add_option('--ignore_locks', action='store_true',
-                    help='GIT ONLY - Ignore cache locks.')
-  parser.add_option('--break_repo_locks', action='store_true',
-                    help='GIT ONLY - Forcibly remove repo locks (e.g. '
-                      'index.lock). This should only be used if you know for '
-                      'certain that this invocation of gclient is the only '
-                      'thing operating on the git repos (e.g. on a bot).')
+  parser.add_option('--ignore_locks',
+                    action='store_true',
+                    help='No longer used.')
+  parser.add_option('--break_repo_locks',
+                    action='store_true',
+                    help='No longer used.')
   parser.add_option('--lock_timeout', type='int', default=5000,
                     help='GIT ONLY - Deadline (in seconds) to wait for git '
                          'cache lock to become available. Default is %default.')
-  # TODO(agable): Remove these when the oldest CrOS release milestone is M56.
-  parser.add_option('-t', '--transitive', action='store_true',
-                    help='DEPRECATED: This is a no-op.')
-  parser.add_option('-m', '--manually_grab_svn_rev', action='store_true',
-                    help='DEPRECATED: This is a no-op.')
-  # TODO(phajdan.jr): Remove validation options once default (crbug/570091).
-  parser.add_option('--validate-syntax', action='store_true', default=True,
-                    help='Validate the .gclient and DEPS syntax')
-  parser.add_option('--disable-syntax-validation', action='store_false',
-                    dest='validate_syntax',
-                    help='Disable validation of .gclient and DEPS syntax.')
   parser.add_option('--no-rebase-patch-ref', action='store_false',
                     dest='rebase_patch_ref', default=True,
                     help='Bypass rebase of the patch ref after checkout.')
@@ -2384,6 +2422,13 @@ def CMDsync(parser, args):
 
   if not client:
     raise gclient_utils.Error('client not configured; see \'gclient config\'')
+
+  if options.ignore_locks:
+    print('Warning: ignore_locks is no longer used. Please remove its usage.')
+
+  if options.break_repo_locks:
+    print('Warning: break_repo_locks is no longer used. Please remove its '
+          'usage.')
 
   if options.revisions and options.head:
     # TODO(maruel): Make it a parser.error if it doesn't break any builder.
@@ -2413,7 +2458,6 @@ CMDupdate = CMDsync
 def CMDvalidate(parser, args):
   """Validates the .gclient and DEPS syntax."""
   options, args = parser.parse_args(args)
-  options.validate_syntax = True
   client = GClient.LoadCurrentConfig(options)
   rv = client.RunOnDeps('validate', args)
   if rv == 0:
@@ -2453,12 +2497,14 @@ def CMDrevert(parser, args):
                     help='don\'t run pre-DEPS hooks', default=False)
   parser.add_option('--upstream', action='store_true',
                     help='Make repo state match upstream branch.')
-  parser.add_option('--break_repo_locks', action='store_true',
-                    help='GIT ONLY - Forcibly remove repo locks (e.g. '
-                      'index.lock). This should only be used if you know for '
-                      'certain that this invocation of gclient is the only '
-                      'thing operating on the git repos (e.g. on a bot).')
+  parser.add_option('--break_repo_locks',
+                    action='store_true',
+                    help='No longer used.')
   (options, args) = parser.parse_args(args)
+  if options.break_repo_locks:
+    print('Warning: break_repo_locks is no longer used. Please remove its ' +
+          'usage.')
+
   # --force is implied.
   options.force = True
   options.reset = False
@@ -2643,8 +2689,8 @@ def CMDsetdep(parser, args):
     else:
       gclient_eval.SetRevision(local_scope, name, value)
 
-  with open(options.deps_file, 'w') as f:
-    f.write(gclient_eval.RenderDEPSFile(local_scope))
+  with open(options.deps_file, 'wb') as f:
+    f.write(gclient_eval.RenderDEPSFile(local_scope).encode('utf-8'))
 
 
 def CMDverify(parser, args):

@@ -204,18 +204,7 @@ class GitWrapper(SCMWrapper):
     if self.out_cb:
       filter_kwargs['predicate'] = self.out_cb
     self.filter = gclient_utils.GitFilter(**filter_kwargs)
-
-  @staticmethod
-  def BinaryExists():
-    """Returns true if the command exists."""
-    try:
-      # We assume git is newer than 1.7.  See: crbug.com/114483
-      result, version = scm.GIT.AssertVersion('1.7')
-      if not result:
-        raise gclient_utils.Error('Git version is older than 1.7: %s' % version)
-      return result
-    except OSError:
-      return False
+    self._running_under_rosetta = None
 
   def GetCheckoutRoot(self):
     return scm.GIT.GetCheckoutRoot(self.checkout_path)
@@ -331,7 +320,7 @@ class GitWrapper(SCMWrapper):
 
     The patch ref is given by |patch_repo|@|patch_rev|.
     |target_rev| is usually the branch that the |patch_rev| was uploaded against
-    (e.g. 'refs/heads/master'), but this is not required.
+    (e.g. 'refs/heads/main'), but this is not required.
 
     We cherry-pick all commits reachable from |patch_rev| on top of the curret
     HEAD, excluding those reachable from |target_rev|
@@ -357,7 +346,7 @@ class GitWrapper(SCMWrapper):
           e.g. 'refs/changes/1234/34/1'.
       target_rev: The revision to use when finding the merge base.
           Typically, the branch that the patch was uploaded against.
-          e.g. 'refs/heads/master' or 'refs/heads/infra/config'.
+          e.g. 'refs/heads/main' or 'refs/heads/infra/config'.
       options: The options passed to gclient.
       file_list: A list where modified files will be appended.
     """
@@ -372,12 +361,13 @@ class GitWrapper(SCMWrapper):
 
     if not target_rev:
       raise gclient_utils.Error('A target revision for the patch must be given')
-    elif target_rev.startswith('refs/heads/'):
-      # If |target_rev| is in refs/heads/**, try first to find the corresponding
-      # remote ref for it, since |target_rev| might point to a local ref which
-      # is not up to date with the corresponding remote ref.
+    elif target_rev.startswith(('refs/heads/', 'refs/branch-heads')):
+      # If |target_rev| is in refs/heads/** or refs/branch-heads/**, try first
+      # to find the corresponding remote ref for it, since |target_rev| might
+      # point to a local ref which is not up to date with the corresponding
+      # remote ref.
       remote_ref = ''.join(scm.GIT.RefToRemoteRef(target_rev, self.remote))
-      self.Print('Trying the correspondig remote ref for %r: %r\n' % (
+      self.Print('Trying the corresponding remote ref for %r: %r\n' % (
           target_rev, remote_ref))
       if scm.GIT.IsValidRevision(self.checkout_path, remote_ref):
         target_rev = remote_ref
@@ -388,16 +378,22 @@ class GitWrapper(SCMWrapper):
 
     self.Print('===Applying patch===')
     self.Print('Revision to patch is %r @ %r.' % (patch_repo, patch_rev))
-    self.Print('Will cherrypick %r .. %r on top of %r.' % (
-        target_rev, patch_rev, base_rev))
     self.Print('Current dir is %r' % self.checkout_path)
     self._Capture(['reset', '--hard'])
-    self._Capture(['fetch', patch_repo, patch_rev])
+    self._Capture(['fetch', '--no-tags', patch_repo, patch_rev])
     patch_rev = self._Capture(['rev-parse', 'FETCH_HEAD'])
 
     if not options.rebase_patch_ref:
       self._Capture(['checkout', patch_rev])
+      # Adjust base_rev to be the first parent of our checked out patch ref;
+      # This will allow us to correctly extend `file_list`, and will show the
+      # correct file-list to programs which do `git diff --cached` expecting to
+      # see the patch diff.
+      base_rev = self._Capture(['rev-parse', patch_rev+'~'])
+
     else:
+      self.Print('Will cherrypick %r .. %r on top of %r.' % (
+          target_rev, patch_rev, base_rev))
       try:
         if scm.GIT.IsAncestor(self.checkout_path, patch_rev, target_rev):
           # If |patch_rev| is an ancestor of |target_rev|, check it out.
@@ -448,8 +444,6 @@ class GitWrapper(SCMWrapper):
 
     self._CheckMinVersion("1.6.6")
 
-    # If a dependency is not pinned, track the default remote branch.
-    default_rev = 'refs/remotes/%s/master' % self.remote
     url, deps_revision = gclient_utils.SplitUrlRevision(self.url)
     revision = deps_revision
     managed = True
@@ -462,7 +456,9 @@ class GitWrapper(SCMWrapper):
       revision = deps_revision
       managed = False
     if not revision:
-      revision = default_rev
+      # If a dependency is not pinned, track the default remote branch.
+      revision = scm.GIT.GetRemoteHeadRef(self.checkout_path, self.url,
+                                          self.remote)
 
     if managed:
       self._DisableHooks()
@@ -477,6 +473,9 @@ class GitWrapper(SCMWrapper):
     revision_ref = revision
     if ':' in revision:
       revision_ref, _, revision = revision.partition(':')
+
+    if revision_ref.startswith('refs/branch-heads'):
+      options.with_branch_heads = True
 
     remote_ref = scm.GIT.RefToRemoteRef(revision, self.remote)
     if remote_ref:
@@ -544,7 +543,8 @@ class GitWrapper(SCMWrapper):
         subprocess2.capture(
             ['git', 'config', 'remote.%s.gclient-auto-fix-url' % self.remote],
             cwd=self.checkout_path).strip() != 'False'):
-      self.Print('_____ switching %s to a new upstream' % self.relpath)
+      self.Print('_____ switching %s from %s to new upstream %s' % (
+          self.relpath, current_url, url))
       if not (options.force or options.reset):
         # Make sure it's clean
         self._CheckClean(revision)
@@ -582,9 +582,9 @@ class GitWrapper(SCMWrapper):
     #      - checkout new branch
     #   c) otherwise exit
 
-    # GetUpstreamBranch returns something like 'refs/remotes/origin/master' for
+    # GetUpstreamBranch returns something like 'refs/remotes/origin/main' for
     # a tracking branch
-    # or 'master' if not a tracking branch (it's based on a specific rev/hash)
+    # or 'main' if not a tracking branch (it's based on a specific rev/hash)
     # or it returns None if it couldn't find an upstream
     if cur_branch is None:
       upstream_branch = None
@@ -810,7 +810,7 @@ class GitWrapper(SCMWrapper):
     if not os.path.isdir(self.checkout_path):
       # revert won't work if the directory doesn't exist. It needs to
       # checkout instead.
-      self.Print('_____ %s is missing, synching instead' % self.relpath)
+      self.Print('_____ %s is missing, syncing instead' % self.relpath)
       # Don't reuse the args.
       return self.update(options, [], file_list)
 
@@ -829,8 +829,8 @@ class GitWrapper(SCMWrapper):
     except NoUsableRevError as e:
       # If the DEPS entry's url and hash changed, try to update the origin.
       # See also http://crbug.com/520067.
-      logging.warn(
-          'Couldn\'t find usable revision, will retrying to update instead: %s',
+      logging.warning(
+          "Couldn't find usable revision, will retrying to update instead: %s",
           e.message)
       return self.update(options, [], file_list)
 
@@ -856,10 +856,11 @@ class GitWrapper(SCMWrapper):
       self.Print('________ couldn\'t run status in %s:\n'
                  'The directory does not exist.' % self.checkout_path)
     else:
-      try:
-        merge_base = [self._Capture(['merge-base', 'HEAD', self.remote])]
-      except subprocess2.CalledProcessError:
-        merge_base = []
+      merge_base = []
+      if self.url:
+        _, base_rev = gclient_utils.SplitUrlRevision(self.url)
+        if base_rev:
+          merge_base = [base_rev]
       self._Run(
           ['-c', 'core.quotePath=false', 'diff', '--name-status'] + merge_base,
           options, always_show_header=options.verbose)
@@ -953,6 +954,14 @@ class GitWrapper(SCMWrapper):
       gclient_utils.safe_makedirs(self.checkout_path)
       gclient_utils.safe_rename(os.path.join(tmp_dir, '.git'),
                                 os.path.join(self.checkout_path, '.git'))
+      # TODO(https://github.com/git-for-windows/git/issues/2569): Remove once
+      # fixed.
+      if sys.platform.startswith('win'):
+        try:
+          self._Run(['config', '--unset', 'core.worktree'], options,
+                    cwd=self.checkout_path)
+        except subprocess2.CalledProcessError:
+          pass
     except:
       traceback.print_exc(file=self.out_fh)
       raise
@@ -981,11 +990,7 @@ class GitWrapper(SCMWrapper):
       raise gclient_utils.Error("Background task requires input. Rerun "
                                 "gclient with --jobs=1 so that\n"
                                 "interaction is possible.")
-    try:
-      return raw_input(prompt)
-    except KeyboardInterrupt:
-      # Hide the exception.
-      sys.exit(1)
+    return gclient_utils.AskForData(prompt)
 
 
   def _AttemptRebase(self, upstream, files, options, newbase=None,
@@ -1176,12 +1181,17 @@ class GitWrapper(SCMWrapper):
     # we don't accidentally go corrupting parent git checks too.  See
     # https://crbug.com/1000825 for an example.
     if set_git_dir:
-      env.setdefault('GIT_DIR', os.path.abspath(os.path.join(
-          self.checkout_path, '.git')))
+      git_dir = os.path.abspath(os.path.join(self.checkout_path, '.git'))
+      # Depending on how the .gclient file was defined, self.checkout_path
+      # might be set to a unicode string, not a regular string; on Windows
+      # Python2, we can't set env vars to be unicode strings, so we
+      # forcibly cast the value to a string before setting it.
+      env.setdefault('GIT_DIR', str(git_dir))
     ret = subprocess2.check_output(
         ['git'] + args, env=env, **kwargs).decode('utf-8')
     if strip:
       ret = ret.strip()
+    self.Print('Finished running: %s %s' % ('git', ' '.join(args)))
     return ret
 
   def _Checkout(self, options, ref, force=False, quiet=None):
@@ -1190,7 +1200,7 @@ class GitWrapper(SCMWrapper):
     Args:
       options: The configured option set
       ref: (str) The branch/commit to checkout
-      quiet: (bool/None) Whether or not the checkout shoud pass '--quiet'; if
+      quiet: (bool/None) Whether or not the checkout should pass '--quiet'; if
           'None', the behavior is inferred from 'options.verbose'.
     Returns: (str) The output of the checkout operation
     """
@@ -1231,12 +1241,11 @@ class GitWrapper(SCMWrapper):
       fetch_cmd.append('--prune')
     if options.verbose:
       fetch_cmd.append('--verbose')
+    if not hasattr(options, 'with_tags') or not options.with_tags:
+      fetch_cmd.append('--no-tags')
     elif quiet:
       fetch_cmd.append('--quiet')
     self._Run(fetch_cmd, options, show_header=options.verbose, retry=True)
-
-    # Return the revision that was fetched; this will be stored in 'FETCH_HEAD'
-    return self._Capture(['rev-parse', '--verify', 'FETCH_HEAD'])
 
   def _SetFetchConfig(self, options):
     """Adds, and optionally fetches, "branch-heads" and "tags" refspecs
@@ -1267,12 +1276,26 @@ class GitWrapper(SCMWrapper):
     """Attempts to fetch |revision| if not available in local repo.
 
     Returns possibly updated revision."""
-    try:
-      self._Capture(['rev-parse', revision])
-    except subprocess2.CalledProcessError:
+    if not scm.GIT.IsValidRevision(self.checkout_path, revision):
       self._Fetch(options, refspec=revision)
       revision = self._Capture(['rev-parse', 'FETCH_HEAD'])
     return revision
+
+  def _IsRunningUnderRosetta(self):
+    if sys.platform != 'darwin':
+      return False
+    if self._running_under_rosetta is None:
+      # If we are running under Rosetta, platform.machine() is
+      # 'x86_64'; we need to use a sysctl to see if we're being
+      # translated.
+      import ctypes
+      libSystem = ctypes.CDLL("libSystem.dylib")
+      ret = ctypes.c_int(0)
+      size = ctypes.c_size_t(4)
+      e = libSystem.sysctlbyname(ctypes.c_char_p(b'sysctl.proc_translated'),
+                                 ctypes.byref(ret), ctypes.byref(size), None, 0)
+      self._running_under_rosetta = e == 0 and ret.value == 1
+    return self._running_under_rosetta
 
   def _Run(self, args, options, **kwargs):
     # Disable 'unused options' warning | pylint: disable=unused-argument
@@ -1280,7 +1303,20 @@ class GitWrapper(SCMWrapper):
     kwargs.setdefault('filter_fn', self.filter)
     kwargs.setdefault('show_header', True)
     env = scm.GIT.ApplyEnvVars(kwargs)
+
     cmd = ['git'] + args
+
+    if self._IsRunningUnderRosetta():
+      # We currently only ship an Intel Python binary in depot_tools.
+      # Intel binaries run under Rosetta on ARM Macs, and by default
+      # prefer to run their subprocesses as Intel under Rosetta too.
+      # Intel git running under Rosetta has a bug where it fails to
+      # clone src.git (rdar://7868319), so until we ship a native
+      # ARM python3 binary, explicitly use `arch` to let git run
+      # the native ARM slice instead of the Intel slice.
+      # TODO(thakis): Remove this again once we ship an arm64 python3
+      # binary.
+      cmd = ['arch', '-arch', 'arm64e', '-arch', 'arm64'] + cmd
     gclient_utils.CheckCallAndFilter(cmd, env=env, **kwargs)
 
 
@@ -1368,15 +1404,16 @@ class CipdRoot(object):
   @contextlib.contextmanager
   def _create_ensure_file(self):
     try:
+      contents = '$ParanoidMode CheckPresence\n\n'
+      for subdir, packages in sorted(self._packages_by_subdir.items()):
+        contents += '@Subdir %s\n' % subdir
+        for package in sorted(packages, key=lambda p: p.name):
+          contents += '%s %s\n' % (package.name, package.version)
+        contents += '\n'
       ensure_file = None
       with tempfile.NamedTemporaryFile(
-          suffix='.ensure', delete=False, mode='w') as ensure_file:
-        ensure_file.write('$ParanoidMode CheckPresence\n\n')
-        for subdir, packages in sorted(self._packages_by_subdir.items()):
-          ensure_file.write('@Subdir %s\n' % subdir)
-          for package in sorted(packages, key=lambda p: p.name):
-            ensure_file.write('%s %s\n' % (package.name, package.version))
-          ensure_file.write('\n')
+          suffix='.ensure', delete=False, mode='wb') as ensure_file:
+        ensure_file.write(contents.encode('utf-8', 'replace'))
       yield ensure_file.name
     finally:
       if ensure_file is not None and os.path.exists(ensure_file.name):

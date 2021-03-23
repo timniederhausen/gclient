@@ -10,6 +10,7 @@ import codecs
 import collections
 import contextlib
 import datetime
+import errno
 import functools
 import io
 import logging
@@ -17,12 +18,6 @@ import operator
 import os
 import pipes
 import platform
-
-try:
-  import Queue as queue
-except ImportError:  # For Py3 compatibility
-  import queue
-
 import re
 import stat
 import subprocess
@@ -30,18 +25,18 @@ import sys
 import tempfile
 import threading
 import time
-
-try:
-  import urlparse
-except ImportError:  # For Py3 compatibility
-  import urllib.parse as urlparse
-
 import subprocess2
 
 if sys.version_info.major == 2:
   from cStringIO import StringIO
+  import collections as collections_abc
+  import Queue as queue
+  import urlparse
 else:
+  from collections import abc as collections_abc
   from io import StringIO
+  import queue
+  import urllib.parse as urlparse
 
 
 RETRY_MAX = 3
@@ -55,7 +50,7 @@ _WARNINGS = []
 # These repos are known to cause OOM errors on 32-bit platforms, due the the
 # very large objects they contain.  It is not safe to use threaded index-pack
 # when cloning/fetching them.
-THREADED_INDEX_PACK_BLACKLIST = [
+THREADED_INDEX_PACK_BLOCKLIST = [
   'https://chromium.googlesource.com/chromium/reference_builds/chrome_win.git'
 ]
 
@@ -164,23 +159,31 @@ class PrintableObject(object):
     return output
 
 
-def FileRead(filename, mode='rU'):
+def AskForData(message):
+  # Use this so that it can be mocked in tests on Python 2 and 3.
+  try:
+    if sys.version_info.major == 2:
+      return raw_input(message)
+    return input(message)
+  except KeyboardInterrupt:
+    # Hide the exception.
+    sys.exit(1)
+
+
+def FileRead(filename, mode='rbU'):
+  # Always decodes output to a Unicode string.
   # On Python 3 newlines are converted to '\n' by default and 'U' is deprecated.
-  if mode == 'rU' and sys.version_info.major == 3:
-    mode = 'r'
+  if mode == 'rbU' and sys.version_info.major == 3:
+    mode = 'rb'
   with open(filename, mode=mode) as f:
-    # codecs.open() has different behavior than open() on python 2.6 so use
-    # open() and decode manually.
     s = f.read()
-    try:
-      return s.decode('utf-8')
-    # AttributeError is for Py3 compatibility
-    except (UnicodeDecodeError, AttributeError):
-      return s
+    if isinstance(s, bytes):
+      return s.decode('utf-8', 'replace')
+    return s
 
 
-def FileWrite(filename, content, mode='w'):
-  with codecs.open(filename, mode=mode, encoding='utf-8') as f:
+def FileWrite(filename, content, mode='w', encoding='utf-8'):
+  with codecs.open(filename, mode=mode, encoding=encoding) as f:
     f.write(content)
 
 
@@ -192,6 +195,35 @@ def temporary_directory(**kwargs):
   finally:
     if tdir:
       rmtree(tdir)
+
+
+@contextlib.contextmanager
+def temporary_file():
+  """Creates a temporary file.
+
+  On Windows, a file must be closed before it can be opened again. This function
+  allows to write something like:
+
+    with gclient_utils.temporary_file() as tmp:
+      gclient_utils.FileWrite(tmp, foo)
+      useful_stuff(tmp)
+
+  Instead of something like:
+
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+      tmp.write(foo)
+      tmp.close()
+      try:
+        useful_stuff(tmp)
+      finally:
+        os.remove(tmp.name)
+  """
+  handle, name = tempfile.mkstemp()
+  os.close(handle)
+  try:
+    yield name
+  finally:
+    os.remove(name)
 
 
 def safe_rename(old, new):
@@ -218,7 +250,7 @@ def safe_rename(old, new):
 
 
 def rm_file_or_tree(path):
-  if os.path.isfile(path):
+  if os.path.isfile(path) or os.path.islink(path):
     os.remove(path)
   else:
     rmtree(path)
@@ -293,7 +325,7 @@ def rmtree(path):
 def safe_makedirs(tree):
   """Creates the directory in a safe manner.
 
-  Because multiple threads can create these directories concurently, trap the
+  Because multiple threads can create these directories concurrently, trap the
   exception and pass on.
   """
   count = 0
@@ -363,16 +395,21 @@ class Annotated(Wrapper):
       self.lock = threading.Lock()
     self.__output_buffers = {}
     self.__include_zero = include_zero
+    self._wrapped_write = getattr(self._wrapped, 'buffer', self._wrapped).write
 
   @property
   def annotated(self):
     return self
 
   def write(self, out):
+    # Store as bytes to ensure Unicode characters get output correctly.
+    if not isinstance(out, bytes):
+      out = out.encode('utf-8')
+
     index = getattr(threading.currentThread(), 'index', 0)
     if not index and not self.__include_zero:
       # Unindexed threads aren't buffered.
-      return self._wrapped.write(out)
+      return self._wrapped_write(out)
 
     self.lock.acquire()
     try:
@@ -380,7 +417,7 @@ class Annotated(Wrapper):
       # Strings are immutable, requiring to keep a lock for the whole dictionary
       # otherwise. Using an array is faster than using a dummy object.
       if not index in self.__output_buffers:
-        obj = self.__output_buffers[index] = ['']
+        obj = self.__output_buffers[index] = [b'']
       else:
         obj = self.__output_buffers[index]
     finally:
@@ -389,19 +426,18 @@ class Annotated(Wrapper):
     # Continue lockless.
     obj[0] += out
     while True:
-      # TODO(agable): find both of these with a single pass.
-      cr_loc = obj[0].find('\r')
-      lf_loc = obj[0].find('\n')
+      cr_loc = obj[0].find(b'\r')
+      lf_loc = obj[0].find(b'\n')
       if cr_loc == lf_loc == -1:
         break
       elif cr_loc == -1 or (lf_loc >= 0 and lf_loc < cr_loc):
-        line, remaining = obj[0].split('\n', 1)
+        line, remaining = obj[0].split(b'\n', 1)
         if line:
-          self._wrapped.write('%d>%s\n' % (index, line))
+          self._wrapped_write(b'%d>%s\n' % (index, line))
       elif lf_loc == -1 or (cr_loc >= 0 and cr_loc < lf_loc):
-        line, remaining = obj[0].split('\r', 1)
+        line, remaining = obj[0].split(b'\r', 1)
         if line:
-          self._wrapped.write('%d>%s\r' % (index, line))
+          self._wrapped_write(b'%d>%s\r' % (index, line))
       obj[0] = remaining
 
   def flush(self):
@@ -420,10 +456,10 @@ class Annotated(Wrapper):
     finally:
       self.lock.release()
 
-    # Don't keep the lock while writting. Will append \n when it shouldn't.
+    # Don't keep the lock while writing. Will append \n when it shouldn't.
     for orphan in orphans:
       if orphan[1]:
-        self._wrapped.write('%d>%s\n' % (orphan[0], orphan[1]))
+        self._wrapped_write(b'%d>%s\n' % (orphan[0], orphan[1]))
     return self._wrapped.flush()
 
 
@@ -550,9 +586,20 @@ def CheckCallAndFilter(args, print_stdout=False, filter_fn=None,
   sleep_interval = RETRY_INITIAL_SLEEP
   run_cwd = kwargs.get('cwd', os.getcwd())
   for attempt in range(RETRY_MAX + 1):
+    # If our stdout is a terminal, then pass in a psuedo-tty pipe to our
+    # subprocess when filtering its output. This makes the subproc believe
+    # it was launched from a terminal, which will preserve ANSI color codes.
+    os_type = GetMacWinAixOrLinux()
+    if sys.stdout.isatty() and os_type != 'win' and os_type != 'aix':
+      pipe_reader, pipe_writer = os.openpty()
+    else:
+      pipe_reader, pipe_writer = os.pipe()
+
     kid = subprocess2.Popen(
-        args, bufsize=0, stdout=subprocess2.PIPE, stderr=subprocess2.STDOUT,
+        args, bufsize=0, stdout=pipe_writer, stderr=subprocess2.STDOUT,
         **kwargs)
+    # Close the write end of the pipe once we hand it off to the child proc.
+    os.close(pipe_writer)
 
     GClientChildren.add(kid)
 
@@ -573,7 +620,14 @@ def CheckCallAndFilter(args, print_stdout=False, filter_fn=None,
     try:
       line_start = None
       while True:
-        in_byte = kid.stdout.read(1)
+        try:
+          in_byte = os.read(pipe_reader, 1)
+        except (IOError, OSError) as e:
+          if e.errno == errno.EIO:
+            # An errno.EIO means EOF?
+            in_byte = None
+          else:
+            raise e
         is_newline = in_byte in (b'\n', b'\r')
         if not in_byte:
           break
@@ -594,8 +648,8 @@ def CheckCallAndFilter(args, print_stdout=False, filter_fn=None,
       if line_start is not None:
         filter_line(command_output, line_start)
 
+      os.close(pipe_reader)
       rv = kid.wait()
-      kid.stdout.close()
 
       # Don't put this in a 'finally,' since the child may still run if we get
       # an exception.
@@ -684,7 +738,7 @@ def FindFileUpwards(filename, path=None):
     path = new_path
 
 
-def GetMacWinOrLinux():
+def GetMacWinAixOrLinux():
   """Returns 'mac', 'win', or 'linux', matching the current platform."""
   if sys.platform.startswith(('cygwin', 'win')):
     return 'win'
@@ -692,6 +746,8 @@ def GetMacWinOrLinux():
     return 'linux'
   elif sys.platform == 'darwin':
     return 'mac'
+  elif sys.platform.startswith('aix'):
+    return 'aix'
   raise Error('Unknown platform: ' + sys.platform)
 
 
@@ -704,7 +760,8 @@ def GetGClientRootAndEntries(path=None):
     return None
   config_path = os.path.join(root, config_file)
   env = {}
-  execfile(config_path, env)
+  with open(config_path) as config:
+    exec(config.read(), env)
   config_dir = os.path.dirname(config_path)
   return config_dir, env['entries']
 
@@ -1173,7 +1230,7 @@ def DefaultIndexPackConfig(url=''):
   performance."""
   cache_limit = DefaultDeltaBaseCacheLimit()
   result = ['-c', 'core.deltaBaseCacheLimit=%s' % cache_limit]
-  if url in THREADED_INDEX_PACK_BLACKLIST:
+  if url in THREADED_INDEX_PACK_BLOCKLIST:
     result.extend(['-c', 'pack.threads=1'])
   return result
 
@@ -1184,7 +1241,7 @@ def FindExecutable(executable):
 
   for path_folder in path_folders:
     target = os.path.join(path_folder, executable)
-    # Just incase we have some ~/blah paths.
+    # Just in case we have some ~/blah paths.
     target = os.path.abspath(os.path.expanduser(target))
     if os.path.isfile(target) and os.access(target, os.X_OK):
       return target
@@ -1208,7 +1265,7 @@ def freeze(obj):
 
   Will raise TypeError if you pass an object which is not hashable.
   """
-  if isinstance(obj, collections.Mapping):
+  if isinstance(obj, collections_abc.Mapping):
     return FrozenDict((freeze(k), freeze(v)) for k, v in obj.items())
   elif isinstance(obj, (list, tuple)):
     return tuple(freeze(i) for i in obj)
@@ -1219,7 +1276,7 @@ def freeze(obj):
     return obj
 
 
-class FrozenDict(collections.Mapping):
+class FrozenDict(collections_abc.Mapping):
   """An immutable OrderedDict.
 
   Modified From: http://stackoverflow.com/a/2704866
@@ -1233,13 +1290,13 @@ class FrozenDict(collections.Mapping):
         operator.xor, (hash(i) for i in enumerate(self._d.items())), 0)
 
   def __eq__(self, other):
-    if not isinstance(other, collections.Mapping):
+    if not isinstance(other, collections_abc.Mapping):
       return NotImplemented
     if self is other:
       return True
     if len(self) != len(other):
       return False
-    for k, v in self.iteritems():
+    for k, v in self.items():
       if k not in other or other[k] != v:
         return False
     return True

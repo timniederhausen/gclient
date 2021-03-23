@@ -22,4 +22,4 @@ if [[ "#grep#fetch#cleanup#diff#setdep#" != *"#$1#"* ]]; then
   fi
 fi
 
-PYTHONDONTWRITEBYTECODE=1 exec python "$base_dir/gclient.py" "$@"
+PYTHONDONTWRITEBYTECODE=1 exec python3 "$base_dir/gclient.py" "$@"

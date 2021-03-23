@@ -16,16 +16,39 @@ from third_party import six
 if six.PY2:
   # We use cStringIO.StringIO because it is equivalent to Py3's io.StringIO.
   from cStringIO import StringIO
+  import collections as collections_abc
 else:
+  from collections import abc as collections_abc
   from io import StringIO
   # pylint: disable=redefined-builtin
   basestring = str
 
 
-class _NodeDict(collections.MutableMapping):
+class ConstantString(object):
+  def __init__(self, value):
+    self.value = value
+
+  def __format__(self, format_spec):
+    del format_spec
+    return self.value
+
+  def __repr__(self):
+    return "Str('" + self.value + "')"
+
+  def __eq__(self, other):
+    if isinstance(other, ConstantString):
+      return self.value == other.value
+    else:
+      return self.value == other
+
+  def __hash__(self):
+      return self.value.__hash__()
+
+
+class _NodeDict(collections_abc.MutableMapping):
   """Dict-like type that also stores information on AST nodes and tokens."""
-  def __init__(self, data, tokens=None):
-    self.data = collections.OrderedDict(data)
+  def __init__(self, data=None, tokens=None):
+    self.data = collections.OrderedDict(data or [])
     self.tokens = tokens
 
   def __str__(self):
@@ -52,7 +75,7 @@ class _NodeDict(collections.MutableMapping):
   def MoveTokens(self, origin, delta):
     if self.tokens:
       new_tokens = {}
-      for pos, token in six.iteritems(self.tokens):
+      for pos, token in self.tokens.items():
         if pos[0] >= origin:
           pos = (pos[0] + delta, pos[1])
           token = token[:2] + (pos,) + token[3:]
@@ -112,7 +135,7 @@ _GCLIENT_DEPS_SCHEMA = _NodeDictSchema({
 _GCLIENT_HOOKS_SCHEMA = [
     _NodeDictSchema({
         # Hook action: list of command-line arguments to invoke.
-        'action': [basestring],
+        'action': [schema.Or(basestring)],
 
         # Name of the hook. Doesn't affect operation.
         schema.Optional('name'): basestring,
@@ -133,7 +156,7 @@ _GCLIENT_HOOKS_SCHEMA = [
 
 _GCLIENT_SCHEMA = schema.Schema(
     _NodeDictSchema({
-        # List of host names from which dependencies are allowed (whitelist).
+        # List of host names from which dependencies are allowed (allowlist).
         # NOTE: when not present, all hosts are allowed.
         # NOTE: scoped to current DEPS file, not recursive.
         schema.Optional('allowed_hosts'): [schema.Optional(basestring)],
@@ -185,7 +208,7 @@ _GCLIENT_SCHEMA = schema.Schema(
         # Recursion limit for nested DEPS.
         schema.Optional('recursion'): int,
 
-        # Whitelists deps for which recursion should be enabled.
+        # Allowlists deps for which recursion should be enabled.
         schema.Optional('recursedeps'): [
             schema.Optional(schema.Or(
                 basestring,
@@ -194,7 +217,7 @@ _GCLIENT_SCHEMA = schema.Schema(
             )),
         ],
 
-        # Blacklists directories for checking 'include_rules'.
+        # Blocklists directories for checking 'include_rules'.
         schema.Optional('skip_child_includes'): [schema.Optional(basestring)],
 
         # Mapping from paths to include rules specific for that path.
@@ -218,7 +241,9 @@ _GCLIENT_SCHEMA = schema.Schema(
 
         # Variables that can be referenced using Var() - see 'deps'.
         schema.Optional('vars'): _NodeDictSchema({
-            schema.Optional(basestring): schema.Or(basestring, bool),
+            schema.Optional(basestring): schema.Or(ConstantString,
+                                                   basestring,
+                                                   bool),
         }),
     }))
 
@@ -226,6 +251,8 @@ _GCLIENT_SCHEMA = schema.Schema(
 def _gclient_eval(node_or_string, filename='<unknown>', vars_dict=None):
   """Safely evaluates a single expression. Returns the result."""
   _allowed_names = {'None': None, 'True': True, 'False': False}
+  if isinstance(node_or_string, ConstantString):
+    return node_or_string.value
   if isinstance(node_or_string, basestring):
     node_or_string = ast.parse(node_or_string, filename=filename, mode='eval')
   if isinstance(node_or_string, ast.Expression):
@@ -248,8 +275,15 @@ def _gclient_eval(node_or_string, filename='<unknown>', vars_dict=None):
     elif isinstance(node, ast.List):
       return list(map(_convert, node.elts))
     elif isinstance(node, ast.Dict):
-      return _NodeDict((_convert(k), (_convert(v), v))
-          for k, v in zip(node.keys, node.values))
+      node_dict = _NodeDict()
+      for key_node, value_node in zip(node.keys, node.values):
+        key = _convert(key_node)
+        if key in node_dict:
+          raise ValueError(
+              'duplicate key in dictionary: %s (file %r, line %s)' % (
+                  key, filename, getattr(key_node, 'lineno', '<unknown>')))
+        node_dict.SetNode(key, _convert(value_node), value_node)
+      return node_dict
     elif isinstance(node, ast.Name):
       if node.id not in _allowed_names:
         raise ValueError(
@@ -260,16 +294,23 @@ def _gclient_eval(node_or_string, filename='<unknown>', vars_dict=None):
         node, ast.NameConstant):  # Since Python 3.4
       return node.value
     elif isinstance(node, ast.Call):
-      if not isinstance(node.func, ast.Name) or node.func.id != 'Var':
+      if (not isinstance(node.func, ast.Name) or
+          (node.func.id not in ('Str', 'Var'))):
         raise ValueError(
-            'Var is the only allowed function (file %r, line %s)' % (
+            'Str and Var are the only allowed functions (file %r, line %s)' % (
                 filename, getattr(node, 'lineno', '<unknown>')))
       if node.keywords or getattr(node, 'starargs', None) or getattr(
           node, 'kwargs', None) or len(node.args) != 1:
         raise ValueError(
-            'Var takes exactly one argument (file %r, line %s)' % (
-                filename, getattr(node, 'lineno', '<unknown>')))
-      arg = _convert(node.args[0])
+            '%s takes exactly one argument (file %r, line %s)' % (
+                node.func.id, filename, getattr(node, 'lineno', '<unknown>')))
+      if node.func.id == 'Str':
+        if isinstance(node.args[0], ast.Str):
+          return ConstantString(node.args[0].s)
+        raise ValueError('Passed a non-string to Str() (file %r, line%s)' % (
+            filename, getattr(node, 'lineno', '<unknown>')))
+      else:
+        arg = _convert(node.args[0])
       if not isinstance(arg, basestring):
         raise ValueError(
             'Var\'s argument must be a variable name (file %r, line %s)' % (
@@ -281,7 +322,10 @@ def _gclient_eval(node_or_string, filename='<unknown>', vars_dict=None):
             '%s was used as a variable, but was not declared in the vars dict '
             '(file %r, line %s)' % (
                 arg, filename, getattr(node, 'lineno', '<unknown>')))
-      return vars_dict[arg]
+      val = vars_dict[arg]
+      if isinstance(val, ConstantString):
+        val = val.value
+      return val
     elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
       return _convert(node.left) + _convert(node.right)
     elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
@@ -370,7 +414,10 @@ def Exec(content, filename='<unknown>', vars_override=None, builtin_vars=None):
     value = _gclient_eval(node, filename, vars_dict)
     local_scope.SetNode(name, value, node)
 
-  return _GCLIENT_SCHEMA.validate(local_scope)
+  try:
+    return _GCLIENT_SCHEMA.validate(local_scope)
+  except schema.SchemaError as e:
+    raise gclient_utils.Error(str(e))
 
 
 def ExecLegacy(content, filename='<unknown>', vars_override=None,
@@ -421,7 +468,7 @@ def _StandardizeDeps(deps_dict, vars_dict):
   new_deps_dict = {}
   for dep_name, dep_info in deps_dict.items():
     dep_name = dep_name.format(**vars_dict)
-    if not isinstance(dep_info, collections.Mapping):
+    if not isinstance(dep_info, collections_abc.Mapping):
       dep_info = {'url': dep_info}
     dep_info.setdefault('dep_type', 'git')
     new_deps_dict[dep_name] = dep_info
@@ -480,7 +527,7 @@ def Parse(content, validate_syntax, filename, vars_override=None,
   """Parses DEPS strings.
 
   Executes the Python-like string stored in content, resulting in a Python
-  dictionary specifyied by the schema above. Supports syntax validation and
+  dictionary specified by the schema above. Supports syntax validation and
   variable expansion.
 
   Args:
@@ -509,14 +556,14 @@ def Parse(content, validate_syntax, filename, vars_override=None,
 
   if 'deps_os' in result:
     deps = result.setdefault('deps', {})
-    for os_name, os_deps in six.iteritems(result['deps_os']):
+    for os_name, os_deps in result['deps_os'].items():
       os_deps = _StandardizeDeps(os_deps, vars_dict)
       _MergeDepsOs(deps, os_deps, os_name)
     del result['deps_os']
 
   if 'hooks_os' in result:
     hooks = result.setdefault('hooks', [])
-    for os_name, os_hooks in six.iteritems(result['hooks_os']):
+    for os_name, os_hooks in result['hooks_os'].items():
       for hook in os_hooks:
         UpdateCondition(hook, 'and', 'checkout_' + os_name)
       hooks.extend(os_hooks)
@@ -632,10 +679,13 @@ def RenderDEPSFile(gclient_dict):
 
 
 def _UpdateAstString(tokens, node, value):
+  if isinstance(node, ast.Call):
+    node = node.args[0]
   position = node.lineno, node.col_offset
   quote_char = ''
   if isinstance(node, ast.Str):
     quote_char = tokens[position][1][0]
+    value = value.encode('unicode_escape').decode('utf-8')
   tokens[position][1] = quote_char + value + quote_char
   node.s = value
 
@@ -790,6 +840,15 @@ def SetRevision(gclient_dict, dep_name, new_revision):
     if isinstance(node, ast.BinOp):
       node = node.right
 
+    if isinstance(node, ast.Str):
+      token = _gclient_eval(tokens[node.lineno, node.col_offset][1])
+      if token != node.s:
+        raise ValueError(
+            'Can\'t update value for %s. Multiline strings and implicitly '
+            'concatenated strings are not supported.\n'
+            'Consider reformatting the DEPS file.' % dep_key)
+
+
     if not isinstance(node, ast.Call) and not isinstance(node, ast.Str):
       raise ValueError(
           "Unsupported dependency revision format. Please file a bug to the "
@@ -831,7 +890,10 @@ def GetVar(gclient_dict, var_name):
     raise KeyError(
         "Could not find any variable called %s." % var_name)
 
-  return gclient_dict['vars'][var_name]
+  val = gclient_dict['vars'][var_name]
+  if isinstance(val, ConstantString):
+    return val.value
+  return val
 
 
 def GetCIPD(gclient_dict, dep_name, package_name):
@@ -864,7 +926,7 @@ def GetRevision(gclient_dict, dep_name):
   elif isinstance(dep, basestring):
     _, _, revision = dep.partition('@')
     return revision or None
-  elif isinstance(dep, collections.Mapping) and 'url' in dep:
+  elif isinstance(dep, collections_abc.Mapping) and 'url' in dep:
     _, _, revision = dep['url'].partition('@')
     return revision or None
   else:

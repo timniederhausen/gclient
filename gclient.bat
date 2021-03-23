@@ -4,5 +4,4 @@
 :: found in the LICENSE file.
 setlocal
 
-:: Defer control.
-python "%~dp0gclient.py" %*
+call py -3 "%~dp0gclient.py" %*
