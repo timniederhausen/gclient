@@ -748,6 +748,8 @@ def GetMacWinAixOrLinux():
     return 'mac'
   elif sys.platform.startswith('aix'):
     return 'aix'
+  elif sys.platform.startswith('freebsd'):
+    return 'freebsd'
   raise Error('Unknown platform: ' + sys.platform)
 
 

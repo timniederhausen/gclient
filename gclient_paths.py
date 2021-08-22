@@ -116,23 +116,6 @@ def GetBuildtoolsPath():
   return None
 
 
-def GetBuildtoolsPlatformBinaryPath():
-  """Returns the full path to the binary directory for the current platform."""
-  buildtools_path = GetBuildtoolsPath()
-  if not buildtools_path:
-    return None
-
-  if sys.platform.startswith(('cygwin', 'win')):
-    subdir = 'win'
-  elif sys.platform == 'darwin':
-    subdir = 'mac'
-  elif sys.platform.startswith('linux'):
-    subdir = 'linux64'
-  else:
-    raise gclient_utils.Error('Unknown platform: ' + sys.platform)
-  return os.path.join(buildtools_path, subdir)
-
-
 def GetExeSuffix():
   """Returns '' or '.exe' depending on how executables work on this platform."""
   if sys.platform.startswith(('cygwin', 'win')):
