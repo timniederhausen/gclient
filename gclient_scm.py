@@ -12,6 +12,7 @@ import errno
 import json
 import logging
 import os
+import platform
 import posixpath
 import re
 import sys
@@ -459,8 +460,10 @@ class GitWrapper(SCMWrapper):
       # If a dependency is not pinned, track the default remote branch.
       revision = scm.GIT.GetRemoteHeadRef(self.checkout_path, self.url,
                                           self.remote)
+    if revision.startswith('origin/'):
+      revision = 'refs/remotes/' + revision
 
-    if managed:
+    if managed and platform.system() == 'Windows':
       self._DisableHooks()
 
     printed_path = False
@@ -1281,22 +1284,6 @@ class GitWrapper(SCMWrapper):
       revision = self._Capture(['rev-parse', 'FETCH_HEAD'])
     return revision
 
-  def _IsRunningUnderRosetta(self):
-    if sys.platform != 'darwin':
-      return False
-    if self._running_under_rosetta is None:
-      # If we are running under Rosetta, platform.machine() is
-      # 'x86_64'; we need to use a sysctl to see if we're being
-      # translated.
-      import ctypes
-      libSystem = ctypes.CDLL("libSystem.dylib")
-      ret = ctypes.c_int(0)
-      size = ctypes.c_size_t(4)
-      e = libSystem.sysctlbyname(ctypes.c_char_p(b'sysctl.proc_translated'),
-                                 ctypes.byref(ret), ctypes.byref(size), None, 0)
-      self._running_under_rosetta = e == 0 and ret.value == 1
-    return self._running_under_rosetta
-
   def _Run(self, args, options, **kwargs):
     # Disable 'unused options' warning | pylint: disable=unused-argument
     kwargs.setdefault('cwd', self.checkout_path)
@@ -1305,18 +1292,6 @@ class GitWrapper(SCMWrapper):
     env = scm.GIT.ApplyEnvVars(kwargs)
 
     cmd = ['git'] + args
-
-    if self._IsRunningUnderRosetta():
-      # We currently only ship an Intel Python binary in depot_tools.
-      # Intel binaries run under Rosetta on ARM Macs, and by default
-      # prefer to run their subprocesses as Intel under Rosetta too.
-      # Intel git running under Rosetta has a bug where it fails to
-      # clone src.git (rdar://7868319), so until we ship a native
-      # ARM python3 binary, explicitly use `arch` to let git run
-      # the native ARM slice instead of the Intel slice.
-      # TODO(thakis): Remove this again once we ship an arm64 python3
-      # binary.
-      cmd = ['arch', '-arch', 'arm64e', '-arch', 'arm64'] + cmd
     gclient_utils.CheckCallAndFilter(cmd, env=env, **kwargs)
 
 

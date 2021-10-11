@@ -225,17 +225,19 @@ class Hook(object):
 
     cmd = [arg for arg in self._action]
 
+    exit_code = 2
     try:
       start_time = time.time()
       gclient_utils.CheckCallAndFilter(
           cmd, cwd=self.effective_cwd, print_stdout=True, show_header=True,
           always_show_header=self._verbose)
+      exit_code = 0
     except (gclient_utils.Error, subprocess2.CalledProcessError) as e:
       # Use a discrete exit status code of 2 to indicate that a hook action
       # failed.  Users of this script may wish to treat hook action failures
       # differently from VC failures.
       print('Error: %s' % str(e), file=sys.stderr)
-      sys.exit(2)
+      sys.exit(exit_code)
     finally:
       elapsed_time = time.time() - start_time
       if elapsed_time > 10:
@@ -523,7 +525,7 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
     # want: self is a 2nd level node. 3rd level node wouldn't need this since
     # they already have their parent as a requirement.
     if self.parent and self.parent.parent and not self.parent.parent.parent:
-      requirements |= set(i.name for i in self.root.dependencies if i.name and i.should_process)
+      requirements |= set(i.name for i in self.root.dependencies if i.name)
 
     if self.name:
       requirements |= set(
@@ -901,8 +903,15 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
       options.revision = revision_override
       self._used_revision = options.revision
       self._used_scm = self.CreateSCM(out_cb=work_queue.out_cb)
-      self._got_revision = self._used_scm.RunCommand(command, options, args,
-                                                     file_list)
+      if command != 'update' or self.GetScmName() != 'git':
+        self._got_revision = self._used_scm.RunCommand(command, options, args,
+                                                       file_list)
+      else:
+        try:
+          self._got_revision = self._used_scm.RunCommand(command, options, args,
+                                                         file_list)
+        finally:
+          url, revision = gclient_utils.SplitUrlRevision(self.url)
 
       patch_repo = self.url.split('@')[0]
       patch_ref = patch_refs.pop(self.FuzzyMatchUrl(patch_refs), None)
@@ -2306,8 +2315,8 @@ def CMDstatus(parser, args):
   gclient sync --force
       update files from SCM according to current configuration, for
       all modules (useful for recovering files deleted from local copy)
-  gclient sync --revision src@31000
-      update src directory to r31000
+  gclient sync --revision src@GIT_COMMIT_OR_REF
+      update src directory to GIT_COMMIT_OR_REF
 
 JSON output format:
 If the --output-json option is specified, the following document structure will
@@ -2334,14 +2343,15 @@ def CMDsync(parser, args):
                     help='don\'t run pre-DEPS hooks', default=False)
   parser.add_option('-r', '--revision', action='append',
                     dest='revisions', metavar='REV', default=[],
-                    help='Enforces revision/hash for the solutions with the '
+                    help='Enforces git ref/hash for the solutions with the '
                          'format src@rev. The src@ part is optional and can be '
                          'skipped. You can also specify URLs instead of paths '
                          'and gclient will find the solution corresponding to '
                          'the given URL. If a path is also specified, the URL '
                          'takes precedence. -r can be used multiple times when '
                          '.gclient has multiple solutions configured, and will '
-                         'work even if the src@ part is skipped.')
+                         'work even if the src@ part is skipped. Revision '
+                         'numbers (e.g. 31000 or r31000) are not supported.')
   parser.add_option('--patch-ref', action='append',
                     dest='patch_refs', metavar='GERRIT_REF', default=[],
                     help='Patches the given reference with the format '
