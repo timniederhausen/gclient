@@ -5,21 +5,4 @@
 
 base_dir=$(dirname "$0")
 
-if [[ "#grep#fetch#cleanup#diff#setdep#" != *"#$1#"* ]]; then
-  # Shall skip authomatic update?
-  if [[ $DEPOT_TOOLS_UPDATE != 0 ]]; then
-    "$base_dir"/update_depot_tools "$@"
-    case $? in
-      123)
-        # msys environment was upgraded, need to quit.
-        exit 0
-        ;;
-      0)
-        ;;
-      *)
-        exit $?
-    esac
-  fi
-fi
-
 PYTHONDONTWRITEBYTECODE=1 exec python3 "$base_dir/gclient.py" "$@"
