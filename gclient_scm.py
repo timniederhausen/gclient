@@ -658,14 +658,20 @@ class GitWrapper(SCMWrapper):
       upstream_branch = self.remote
       if options.revision or deps_revision:
         upstream_branch = revision
-      self._AttemptRebase(upstream_branch, file_list, options,
-                          printed_path=printed_path, merge=options.merge)
+      if not options.reset:
+        self._AttemptRebase(upstream_branch, file_list, options,
+                            printed_path=printed_path, merge=options.merge)
+      else:
+        self._FetchAndReset(revision, file_list, options)
       printed_path = True
     elif rev_type == 'hash':
       # case 2
-      self._AttemptRebase(upstream_branch, file_list, options,
-                          newbase=revision, printed_path=printed_path,
-                          merge=options.merge)
+      if not options.reset:
+        self._AttemptRebase(upstream_branch, file_list, options,
+                            newbase=revision, printed_path=printed_path,
+                            merge=options.merge)
+      else:
+        self._FetchAndReset(revision, file_list, options)
       printed_path = True
     elif remote_ref and ''.join(remote_ref) != upstream_branch:
       # case 4
