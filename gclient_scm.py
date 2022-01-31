@@ -277,6 +277,15 @@ class GitWrapper(SCMWrapper):
     self._SetFetchConfig(options)
 
     self._Fetch(options, prune=True, quiet=options.verbose)
+
+    # TODO: why can't we use the local branch name?
+    sha1 = scm.GIT.ResolveCommit(self.checkout_path, revision)
+    if sha1 != revision.lower():
+      if not revision.startswith('refs/remotes'):
+        qualified_name = 'refs/remotes/%s/%s' % (self.remote, revision)
+        if scm.GIT.IsValidRevision(self.checkout_path, qualified_name):
+          revision = qualified_name
+
     self._Scrub(revision, options)
     if file_list is not None:
       files = self._Capture(
