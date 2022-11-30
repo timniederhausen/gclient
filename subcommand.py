@@ -147,11 +147,11 @@ class CommandDispatcher(object):
         reverse=True)
     if (hamming_commands[0][0] - hamming_commands[1][0]) < 0.3:
       # Too ambiguous.
-      return
+      return None
 
     if hamming_commands[0][0] < 0.8:
       # Not similar enough. Don't be a fool and run a random command.
-      return
+      return None
 
     return commands[hamming_commands[0][1]]
 
@@ -255,7 +255,9 @@ class CommandDispatcher(object):
     if cmdhelp:
       # Not a known command. Default to help.
       self._add_command_usage(parser, cmdhelp)
-      return cmdhelp(parser, args)
+      # Don't pass list of arguments as those may not be supported by cmdhelp.
+      # See: https://crbug.com/1352093
+      return cmdhelp(parser, [])
 
     # Nothing can be done.
     return 2

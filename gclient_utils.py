@@ -39,8 +39,11 @@ else:
   import urllib.parse as urlparse
 
 
-RETRY_MAX = 3
-RETRY_INITIAL_SLEEP = 0.5
+# Git wrapper retries on a transient error, and some callees do retries too,
+# such as GitWrapper.update (doing clone). One retry attempt should be
+# sufficient to help with any transient errors at this level.
+RETRY_MAX = 1
+RETRY_INITIAL_SLEEP = 2  # in seconds
 START = datetime.datetime.now()
 
 
@@ -95,6 +98,27 @@ def AddWarning(msg):
   _WARNINGS.append(msg)
 
 
+def FuzzyMatchRepo(repo, candidates):
+  # type: (str, Union[Collection[str], Mapping[str, Any]]) -> Optional[str]
+  """Attempts to find a representation of repo in the candidates.
+
+  Args:
+    repo: a string representation of a repo in the form of a url or the
+      name and path of the solution it represents.
+    candidates: The candidates to look through which may contain `repo` in
+      in any of the forms mentioned above.
+  Returns:
+    The matching string, if any, which may be in a different form from `repo`.
+  """
+  if repo in candidates:
+    return repo
+  if repo.endswith('.git') and repo[:-len('.git')] in candidates:
+    return repo[:-len('.git')]
+  if repo + '.git' in candidates:
+    return repo + '.git'
+  return None
+
+
 def SplitUrlRevision(url):
   """Splits url and returns a two-tuple: url, rev"""
   if url.startswith('ssh:'):
@@ -109,6 +133,15 @@ def SplitUrlRevision(url):
     if len(components) == 1:
       components += [None]
   return tuple(components)
+
+
+def ExtractRefName(remote, full_refs_str):
+  """Returns the ref name if full_refs_str is a valid ref."""
+  result = re.compile(r'^refs(\/.+)?\/((%s)|(heads)|(tags))\/(?P<ref_name>.+)' %
+                      remote).match(full_refs_str)
+  if result:
+    return result.group('ref_name')
+  return None
 
 
 def IsGitSha(revision):
@@ -160,6 +193,15 @@ class PrintableObject(object):
 
 
 def AskForData(message):
+  # Try to load the readline module, so that "elaborate line editing" features
+  # such as backspace work for `raw_input` / `input`.
+  try:
+    import readline
+  except ImportError:
+    # The readline module does not exist in all Python distributions, e.g. on
+    # Windows. Fall back to simple input handling.
+    pass
+
   # Use this so that it can be mocked in tests on Python 2 and 3.
   try:
     if sys.version_info.major == 2:
@@ -292,8 +334,8 @@ def rmtree(path):
       exitcode = subprocess.call(['cmd.exe', '/c', 'rd', '/q', '/s', path])
       if exitcode == 0:
         return
-      else:
-        print('rd exited with code %d' % exitcode, file=sys.stderr)
+
+      print('rd exited with code %d' % exitcode, file=sys.stderr)
       time.sleep(3)
     raise Exception('Failed to remove path %s' % path)
 
@@ -428,11 +470,12 @@ class Annotated(Wrapper):
       lf_loc = obj[0].find(b'\n')
       if cr_loc == lf_loc == -1:
         break
-      elif cr_loc == -1 or (lf_loc >= 0 and lf_loc < cr_loc):
+
+      if cr_loc == -1 or (0 <= lf_loc < cr_loc):
         line, remaining = obj[0].split(b'\n', 1)
         if line:
           self._wrapped_write(b'%d>%s\n' % (index, line))
-      elif lf_loc == -1 or (cr_loc >= 0 and cr_loc < lf_loc):
+      elif lf_loc == -1 or (0 <= cr_loc < lf_loc):
         line, remaining = obj[0].split(b'\r', 1)
         if line:
           self._wrapped_write(b'%d>%s\r' % (index, line))
@@ -741,13 +784,17 @@ def GetMacWinAixOrLinux():
   """Returns 'mac', 'win', or 'linux', matching the current platform."""
   if sys.platform.startswith(('cygwin', 'win')):
     return 'win'
-  elif sys.platform.startswith('linux'):
+
+  if sys.platform.startswith('linux'):
     return 'linux'
-  elif sys.platform == 'darwin':
+
+  if sys.platform == 'darwin':
     return 'mac'
-  elif sys.platform.startswith('aix'):
+
+  if sys.platform.startswith('aix'):
     return 'aix'
-  elif sys.platform.startswith('freebsd'):
+
+  if sys.platform.startswith('freebsd'):
     return 'freebsd'
   raise Error('Unknown platform: ' + sys.platform)
 
@@ -1220,8 +1267,8 @@ def DefaultDeltaBaseCacheLimit():
 
   if is_64bit:
     return '2g'
-  else:
-    return '512m'
+
+  return '512m'
 
 
 def DefaultIndexPackConfig(url=''):
@@ -1268,13 +1315,15 @@ def freeze(obj):
   """
   if isinstance(obj, collections_abc.Mapping):
     return FrozenDict((freeze(k), freeze(v)) for k, v in obj.items())
-  elif isinstance(obj, (list, tuple)):
+
+  if isinstance(obj, (list, tuple)):
     return tuple(freeze(i) for i in obj)
-  elif isinstance(obj, set):
+
+  if isinstance(obj, set):
     return frozenset(freeze(i) for i in obj)
-  else:
-    hash(obj)
-    return obj
+
+  hash(obj)
+  return obj
 
 
 class FrozenDict(collections_abc.Mapping):

@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # Copyright 2014 The Chromium Authors. All rights reserved.
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
@@ -21,10 +21,10 @@ def HostArch():
     host_arch = 'x86'
   elif host_arch in ['x86_64', 'amd64']:
     host_arch = 'x64'
+  elif host_arch == 'arm64' or host_arch.startswith('aarch64'):
+    host_arch = 'arm64'
   elif host_arch.startswith('arm'):
     host_arch = 'arm'
-  elif host_arch.startswith('aarch64'):
-    host_arch = 'arm64'
   elif host_arch.startswith('mips64'):
     host_arch = 'mips64'
   elif host_arch.startswith('mips'):
@@ -33,6 +33,8 @@ def HostArch():
     host_arch = 'ppc'
   elif host_arch.startswith('s390'):
     host_arch = 's390'
+  elif host_arch.startswith('riscv'):
+    host_arch = 'riscv64'
 
 
   # platform.machine is based on running kernel. It's possible to use 64-bit
