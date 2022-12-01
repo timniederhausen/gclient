@@ -374,7 +374,7 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
 
   def __init__(self, parent, name, url, managed, custom_deps,
                custom_vars, custom_hooks, deps_file, should_process,
-               should_recurse, relative, condition, protocol='https',
+               should_recurse, relative, condition, protocol=None,
                print_outbuf=False):
     gclient_utils.WorkItem.__init__(self, name)
     DependencySettings.__init__(
