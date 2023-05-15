@@ -515,6 +515,8 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
     self.set_url(url)
 
   def ToLines(self):
+    # () -> Sequence[str]
+    """Returns strings representing the deps (info, graphviz line)"""
     s = []
     condition_part = (['    "condition": %r,' % self.condition]
                       if self.condition else [])
@@ -649,7 +651,11 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
     for d, url in processed_deps.items():
       # normpath is required to allow DEPS to use .. in their
       # dependency local path.
-      rel_deps[os.path.normpath(os.path.join(rel_prefix, d))] = url
+      # We are following the same pattern when use_relative_paths = False,
+      # which uses slashes.
+      rel_deps[os.path.normpath(os.path.join(rel_prefix,
+                                             d)).replace(os.path.sep,
+                                                         '/')] = url
     logging.warning('Updating deps by prepending %s.', rel_prefix)
     return rel_deps
 
@@ -810,8 +816,8 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
         logging.warning('Updating recursedeps by prepending %s.', rel_prefix)
         rel_deps = {}
         for depname, options in self.recursedeps.items():
-          rel_deps[
-              os.path.normpath(os.path.join(rel_prefix, depname))] = options
+          rel_deps[os.path.normpath(os.path.join(rel_prefix, depname)).replace(
+              os.path.sep, '/')] = options
         self.recursedeps = rel_deps
     # To get gn_args from another DEPS, that DEPS must be recursed into.
     if self._gn_args_from:
@@ -1282,16 +1288,20 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
   def __repr__(self):
     return '%s: %s' % (self.name, self.url)
 
-  def hierarchy(self, include_url=True):
+  def hierarchy(self, include_url=True, graphviz=False):
     """Returns a human-readable hierarchical reference to a Dependency."""
     def format_name(d):
       if include_url:
         return '%s(%s)' % (d.name, d.url)
-      return d.name
+      return '"%s"' % d.name  # quotes required for graph dot file.
+
     out = format_name(self)
     i = self.parent
     while i and i.name:
       out = '%s -> %s' % (format_name(i), out)
+      if graphviz:
+        # for graphviz we just need each parent->child relationship listed once.
+        return out
       i = i.parent
     return out
 
@@ -1370,11 +1380,16 @@ def merge_vars(result, new_vars):
 
 
 def _detect_host_os():
-  try:
+  if sys.platform in _PLATFORM_MAPPING:
     return _PLATFORM_MAPPING[sys.platform]
-  except KeyError:
-    if sys.platform.startswith('freebsd'):
-      return 'freebsd'
+
+  if sys.platform.startswith('freebsd'):
+    return 'freebsd'
+
+  try:
+    return os.uname().sysname.lower()
+  except AttributeError:
+    return sys.platform
 
 
 class GitDependency(Dependency):
@@ -2038,10 +2053,13 @@ class CipdDependency(Dependency):
         self.url, self.root.root_dir, self.name, self.outbuf, out_cb,
         root=self._cipd_root, package=self._cipd_package)
 
-  def hierarchy(self, include_url=False):
+  def hierarchy(self, include_url=False, graphviz=False):
+    if graphviz:
+      return ''  # graphviz lines not implemented for cipd deps.
     return self.parent.hierarchy(include_url) + ' -> ' + self._cipd_subdir
 
   def ToLines(self):
+    # () -> Sequence[str]
     """Return a list of lines representing this in a DEPS file."""
     def escape_cipd_var(package):
       return package.replace('{', '{{').replace('}', '}}')
@@ -2154,6 +2172,7 @@ class Flattener(object):
     self._client = client
 
     self._deps_string = None
+    self._deps_graph_lines = None
     self._deps_files = set()
 
     self._allowed_hosts = set()
@@ -2168,6 +2187,11 @@ class Flattener(object):
   def deps_string(self):
     assert self._deps_string is not None
     return self._deps_string
+
+  @property
+  def deps_graph_lines(self):
+    assert self._deps_graph_lines is not None
+    return self._deps_graph_lines
 
   @property
   def deps_files(self):
@@ -2225,16 +2249,17 @@ class Flattener(object):
 
     gn_args_dep = self._deps.get(self._client.dependencies[0]._gn_args_from,
                                  self._client.dependencies[0])
+
+    self._deps_graph_lines = _DepsToDotGraphLines(self._deps)
     self._deps_string = '\n'.join(
         _GNSettingsToLines(gn_args_dep._gn_args_file, gn_args_dep._gn_args) +
-        _AllowedHostsToLines(self._allowed_hosts) +
-        _DepsToLines(self._deps) +
+        _AllowedHostsToLines(self._allowed_hosts) + _DepsToLines(self._deps) +
         _HooksToLines('hooks', self._hooks) +
         _HooksToLines('pre_deps_hooks', self._pre_deps_hooks) +
-        _VarsToLines(self._vars) +
-        ['# %s, %s' % (url, deps_file)
-         for url, deps_file, _ in sorted(self._deps_files)] +
-        [''])  # Ensure newline at end of file.
+        _VarsToLines(self._vars) + [
+            '# %s, %s' % (url, deps_file)
+            for url, deps_file, _ in sorted(self._deps_files)
+        ] + [''])  # Ensure newline at end of file.
 
   def _add_dep(self, dep):
     """Helper to add a dependency to flattened DEPS.
@@ -2306,11 +2331,15 @@ def CMDflatten(parser, args):
       '--pin-all-deps', action='store_true',
       help=('Pin all deps, even if not pinned in DEPS. CAVEAT: only does so '
             'for checked out deps, NOT deps_os.'))
+  parser.add_option('--deps-graph-file',
+                    help='Provide a path for the output graph file')
   options, args = parser.parse_args(args)
 
   options.nohooks = True
   options.process_all_deps = True
   client = GClient.LoadCurrentConfig(options)
+  if not client:
+    raise gclient_utils.Error('client not configured; see \'gclient config\'')
 
   # Only print progress if we're writing to a file. Otherwise, progress updates
   # could obscure intended output.
@@ -2325,6 +2354,10 @@ def CMDflatten(parser, args):
       f.write(flattener.deps_string)
   else:
     print(flattener.deps_string)
+
+  if options.deps_graph_file:
+    with open(options.deps_graph_file, 'w') as f:
+      f.write('\n'.join(flattener.deps_graph_lines))
 
   deps_files = [{'url': d[0], 'deps_file': d[1], 'hierarchy': d[2]}
                 for d in sorted(flattener.deps_files)]
@@ -2357,6 +2390,7 @@ def _AllowedHostsToLines(allowed_hosts):
 
 
 def _DepsToLines(deps):
+  # type: (Mapping[str, Dependency]) -> Sequence[str]
   """Converts |deps| dict to list of lines for output."""
   if not deps:
     return []
@@ -2365,6 +2399,20 @@ def _DepsToLines(deps):
     s.extend(dep.ToLines())
   s.extend(['}', ''])
   return s
+
+
+def _DepsToDotGraphLines(deps):
+  # type: (Mapping[str, Dependency]) -> Sequence[str]
+  """Converts  |deps| dict to list of lines for dot graphs"""
+  if not deps:
+    return []
+  graph_lines = ["digraph {\n\trankdir=\"LR\";"]
+  for _, dep in sorted(deps.items()):
+    line = dep.hierarchy(include_url=False, graphviz=True)
+    if line:
+      graph_lines.append("\t%s" % line)
+  graph_lines.append("}")
+  return graph_lines
 
 
 def _DepsOsToLines(deps_os):
@@ -2722,6 +2770,8 @@ def CMDvalidate(parser, args):
   """Validates the .gclient and DEPS syntax."""
   options, args = parser.parse_args(args)
   client = GClient.LoadCurrentConfig(options)
+  if not client:
+    raise gclient_utils.Error('client not configured; see \'gclient config\'')
   rv = client.RunOnDeps('validate', args)
   if rv == 0:
     print('validate: SUCCESS')

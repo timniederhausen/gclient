@@ -76,8 +76,8 @@ def GetPrimarySolutionPath():
   # checkout that contains a 'buildtools' subdir.
   top_dir = os.getcwd()
   try:
-    top_dir = subprocess2.check_output(
-        ['git', 'rev-parse', '--show-toplevel'])
+    top_dir = subprocess2.check_output(['git', 'rev-parse', '--show-toplevel'],
+                                       stderr=subprocess2.DEVNULL)
     if sys.version_info.major == 3:
       top_dir = top_dir.decode('utf-8', 'replace')
     top_dir = os.path.normpath(top_dir.strip())
@@ -114,6 +114,23 @@ def GetBuildtoolsPath():
     return buildtools_path
 
   return None
+
+
+def GetBuildtoolsPlatformBinaryPath():
+  """Returns the full path to the binary directory for the current platform."""
+  buildtools_path = GetBuildtoolsPath()
+  if not buildtools_path:
+    return None
+
+  if sys.platform.startswith(('cygwin', 'win')):
+    subdir = 'win'
+  elif sys.platform == 'darwin':
+    subdir = 'mac'
+  elif sys.platform.startswith('linux'):
+    subdir = 'linux64'
+  else:
+    raise gclient_utils.Error('Unknown platform: ' + sys.platform)
+  return os.path.join(buildtools_path, subdir)
 
 
 def GetExeSuffix():
