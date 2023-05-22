@@ -27,6 +27,7 @@ except ImportError:  # For Py3 compatibility
 
 import gclient_utils
 import scm
+import scm_p4
 import shutil
 import subprocess2
 
@@ -1558,3 +1559,104 @@ class CipdWrapper(SCMWrapper):
     `CipdRoot.run('update')`.
     """
     pass
+
+
+class P4Wrapper(SCMWrapper):
+  """Wrapper for Perforce.
+  """
+  name = 'p4'
+
+  def __init__(self, url=None, root_dir=None, relpath=None, out_fh=None, out_cb=None):
+    super(P4Wrapper, self).__init__(
+        url=url, root_dir=root_dir, relpath=relpath, out_fh=out_fh,
+        out_cb=out_cb)
+    self.context = scm_p4.P4Context.for_checkout(self.checkout_path, self.url)
+
+  #override
+  def GetCacheMirror(self):
+    return None
+
+  #override
+  def GetActualRemoteURL(self, options):
+    return self.url
+
+  #override
+  def DoesRemoteURLMatch(self, options):
+    del options
+    return True
+
+  def revert(self, options, args, file_list):
+    if not os.path.isdir(self.checkout_path):
+      # revert won't work if the directory doesn't exist. It needs to
+      # checkout instead.
+      self.Print('_____ %s is missing, syncing instead' % self.relpath)
+      # Don't reuse the args.
+    return self.update(options, [], file_list)
+
+  def diff(self, options, args, file_list):
+    self.pack(options, args, file_list)
+
+  def pack(self, _options, _args, _file_list, filter_fn=None):
+    parsed_url = scm_p4.parse_workspace_url(self.url)
+    if parsed_url.changelist:
+      self.context.call(['diff', '-du', f'@{parsed_url.changelist}'])
+    else:
+      self.context.call(['diff', '-du'])
+
+  def revinfo(self, options, args, file_list):
+    output = self.context.run_marshalled(['changes', '-s', 'submitted', '-m1'], check=True)
+    return int(output[0][b'change'])
+
+  def runhooks(self, options, args, file_list):
+    self.status(options, args, file_list)
+
+  def status(self, options, args, file_list):
+    if not os.path.isdir(self.checkout_path):
+      self.Print('________ couldn\'t run status in %s:\n'
+                 'The directory does not exist.' % self.checkout_path)
+      return
+    output = self.context.run_marshalled(['status', '-m'], check=False)
+    for file_record in output:
+      if file_record[b'code'] == b'stat':
+        file_list.append(file_record[b'clientFile'])
+
+  def update(self, options, args, file_list):
+    if args:
+      raise gclient_utils.Error("Unsupported argument(s): %s" % ",".join(args))
+
+    self._CreateClient()
+
+    parsed_url = scm_p4.parse_workspace_url(self.url)
+    revision = options.revision or parsed_url.changelist
+
+    args = ['sync']
+    if options.force or options.reset:
+      args += ['-f']
+    if revision and revision != 'unmanaged':
+        args += [f'#{revision}']
+
+    output = self.context.run_marshalled(args, check=True, cwd=self.checkout_path)
+    print(output)
+
+    # https://www.perforce.com/manuals/p4api.net/p4api.net_reference/html/T_Perforce_P4_ErrorGeneric.htm
+    EV_EMPTY = 17
+    for file_record in output:
+      if file_record[b'code'] == b'stat':
+        file_list.append(file_record[b'clientFile'].decode('utf-8'))
+
+  def _CreateClient(self):
+    parsed_url = scm_p4.parse_workspace_url(self.url)
+
+    stream = None
+    if parsed_url.depot_type == 'stream':
+      stream = parsed_url.path
+
+    scm_p4.create_client(self.context, self.context.client, self.checkout_path,
+                         options=['noallwrite', 'clobber', 'nocompress', 'unlocked', 'modtime', 'rmdir'],
+                         stream=stream)
+
+
+def get_scm_type(url: str):
+  if url.startswith('p4://'):
+    return 'p4'
+  return 'git'

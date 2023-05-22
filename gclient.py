@@ -604,6 +604,10 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
     # type: (Mapping[str, Mapping[str, str]], str) ->
     #     Mapping[str, Mapping[str, str]]
     """Performs post-processing of deps compared to what's in the DEPS file."""
+
+    for dep_info in deps.values():
+      dep_info.setdefault('dep_type', gclient_scm.get_scm_type(dep_info['url']))
+
     # If we don't need to sync, only process custom_deps, if any.
     if not self._should_sync:
       if not self.custom_deps:
@@ -617,7 +621,7 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
             # in the Dependency itself with _OverrideUrl().
             processed_deps[dep_name] = deps[dep_name]
           else:
-            processed_deps[dep_name] = {'url': dep_info, 'dep_type': 'git'}
+            processed_deps[dep_name] = {'url': dep_info, 'dep_type': gclient_scm.get_scm_type(dep_info)}
     else:
       processed_deps = dict(deps)
 
@@ -631,7 +635,7 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
         # https://crbug.com/1031185
         if (dep_name not in processed_deps and dep_info
             and not dep_info.endswith('@unmanaged')):
-          processed_deps[dep_name] = {'url': dep_info, 'dep_type': 'git'}
+          processed_deps[dep_name] = {'url': dep_info, 'dep_type': gclient_scm.get_scm_type(dep_info)}
 
     # Make child deps conditional on any parent conditions. This ensures that,
     # when flattened, recursed entries have the correct restrictions, even if
@@ -672,7 +676,6 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
       condition = dep_value.get('condition')
       dep_type = dep_value.get('dep_type')
 
-
       if condition and not self._get_option('process_all_deps', False):
         if condition not in cached_conditions:
           cached_conditions[condition] = gclient_eval.EvaluateCondition(
@@ -696,6 +699,22 @@ class Dependency(gclient_utils.WorkItem, DependencySettings):
                   should_process=should_process,
                   relative=use_relative_paths,
                   condition=condition))
+      elif dep_type == 'p4':
+        url = dep_value.get('url')
+        deps_to_add.append(P4Dependency(
+                parent=self,
+                name=name,
+                url=url,
+                managed=True,
+                custom_deps=None,
+                custom_vars=self.custom_vars,
+                custom_hooks=None,
+                deps_file=self.recursedeps.get(name, self.deps_file),
+                should_process=should_process,
+                should_recurse=name in self.recursedeps,
+                relative=use_relative_paths,
+                condition=condition,
+                protocol=self.protocol))
       else:
         url = dep_value.get('url')
         deps_to_add.append(
@@ -1416,6 +1435,20 @@ class GitDependency(Dependency):
     return gclient_scm.GitWrapper(
         self.url, self.root.root_dir, self.name, self.outbuf, out_cb,
         print_outbuf=self.print_outbuf)
+
+
+class P4Dependency(Dependency):
+  """A Dependency object that represents a single P4 client."""
+
+  #override
+  def GetScmName(self):
+    """Always 'p4'."""
+    return 'p4'
+
+  #override
+  def CreateSCM(self, out_cb=None):
+    """Create a Wrapper instance suitable for handling this CIPD dependency."""
+    return gclient_scm.P4Wrapper(self.url, self.root.root_dir, self.name, self.outbuf, out_cb)
 
 
 class GClient(GitDependency):
@@ -2718,6 +2751,8 @@ def CMDsync(parser, args):
   parser.add_option('--no-reset-patch-ref', action='store_false',
                     dest='reset_patch_ref', default=True,
                     help='Bypass calling reset after patching the ref.')
+  parser.add_option('--ignore-dep-type', choices=['git', 'cipd', 'p4'],
+                    help='Specify to skip processing of a certain type of dep.')
   parser.add_option('--experiment',
                     action='append',
                     dest='experiments',
@@ -2873,7 +2908,7 @@ def CMDrevinfo(parser, args):
   parser.add_option('--output-json',
                     help='Output a json document to this path containing '
                          'information about the revisions.')
-  parser.add_option('--ignore-dep-type', choices=['git', 'cipd'],
+  parser.add_option('--ignore-dep-type', choices=['git', 'cipd', 'p4'],
                     help='Specify to skip processing of a certain type of dep.')
   (options, args) = parser.parse_args(args)
   client = GClient.LoadCurrentConfig(options)

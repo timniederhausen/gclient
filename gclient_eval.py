@@ -479,7 +479,6 @@ def _StandardizeDeps(deps_dict, vars_dict):
     dep_name = dep_name.format(**vars_dict)
     if not isinstance(dep_info, collections_abc.Mapping):
       dep_info = {'url': dep_info}
-    dep_info.setdefault('dep_type', 'git')
     new_deps_dict[dep_name] = dep_info
   return new_deps_dict
 
