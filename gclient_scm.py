@@ -1633,10 +1633,9 @@ class P4Wrapper(SCMWrapper):
     if options.force or options.reset:
       args += ['-f']
     if revision and revision != 'unmanaged':
-        args += [f'#{revision}']
+        args += [f'@{revision}']
 
     output = self.context.run_marshalled(args, check=True, cwd=self.checkout_path)
-    print(output)
 
     # https://www.perforce.com/manuals/p4api.net/p4api.net_reference/html/T_Perforce_P4_ErrorGeneric.htm
     EV_EMPTY = 17
