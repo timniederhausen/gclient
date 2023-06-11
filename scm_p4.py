@@ -43,7 +43,7 @@ def unmarshal_p4_output(stdout: bytes, check=False):
   E_FAILED = 3
 
   fp = io.BytesIO(stdout)
-  results = []
+  results: typing.List[typing.Dict[bytes, bytes]] = []
   try:
     while True:
       result = marshal.load(fp)
@@ -82,13 +82,35 @@ def format_client_name(checkout_path: str, parsed_url: PerforceWorkspaceUrl):
                                      suffix=zlib.crc32(checkout_path.encode('utf-8')))
 
 
-class P4Context(object):
+class P4Environment(object):
   def __init__(self, port: str = None, user: str = None, passwd: str = None, client: str = None):
     self.port = port
     self.user = user
     self.passwd = passwd
     self.client = client
 
+  @staticmethod
+  def from_workspace(checkout_path: str):
+    try:
+      output = subprocess.check_output(['p4', 'set', '-q'], cwd=checkout_path, universal_newlines=True).split('\n')
+    except subprocess.CalledProcessError:
+      return P4Environment()
+
+    if not output:
+      raise RuntimeError(f'Empty response from p4 set')
+
+    records = {}
+    for line in output:
+      tokens = line.partition('=')
+      records[tokens[0]] = tokens[2]
+
+    return P4Environment(records.get('P4PORT'),
+                         records.get('P4USER'),
+                         records.get('P4PASSWD'),
+                         records.get('P4CLIENT'))
+
+
+class P4Context(P4Environment):
   def prepare_environment(self, kwargs):
     env = kwargs.pop('env', None) or os.environ.copy()
     if self.port:
@@ -132,8 +154,11 @@ class P4Context(object):
   @staticmethod
   def for_checkout(checkout_path: str, url: str, client_name: str = None):
     parsed_url = parse_workspace_url(url)
-    user = parsed_url.username or os.environ.get('P4USER')
+    default_environment = P4Environment.from_workspace(checkout_path)
+    user = parsed_url.username or default_environment.user
     password = parsed_url.password or os.environ.get('P4PASSWD')
+    if client_name is None:
+      client_name = default_environment.client
     if client_name is None:
       client_name = format_client_name(checkout_path, parsed_url)
     return P4Context(parsed_url.port, user, password, client_name)
@@ -197,7 +222,7 @@ def create_change(ctx: P4Context, description: str = '', type: str = None, user:
   if type:
     spec['Type'] = type
   if user:
-    spec['User'] = user
+    spec['User'] = user or ctx.user
 
   output = ctx.run_marshalled(['change', '-i'], input=spec)
   for result in output:
