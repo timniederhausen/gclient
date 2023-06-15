@@ -1599,12 +1599,12 @@ class P4Wrapper(SCMWrapper):
   def pack(self, _options, _args, _file_list, filter_fn=None):
     parsed_url = scm_p4.parse_workspace_url(self.url)
     if parsed_url.changelist:
-      self.context.call(['diff', '-du', f'@{parsed_url.changelist}'])
+      self.context.call(['diff', '-du', f'@{parsed_url.changelist}'], cwd=self.checkout_path)
     else:
-      self.context.call(['diff', '-du'])
+      self.context.call(['diff', '-du'], cwd=self.checkout_path)
 
   def revinfo(self, options, args, file_list):
-    output = self.context.run_marshalled(['changes', '-s', 'submitted', '-m1'], check=True)
+    output = self.context.run_marshalled(['changes', '-s', 'submitted', '-m1'], check=True, cwd=self.checkout_path)
     return int(output[0][b'change'])
 
   def runhooks(self, options, args, file_list):
@@ -1615,7 +1615,7 @@ class P4Wrapper(SCMWrapper):
       self.Print('________ couldn\'t run status in %s:\n'
                  'The directory does not exist.' % self.checkout_path)
       return
-    output = self.context.run_marshalled(['status', '-m'], check=False)
+    output = self.context.run_marshalled(['status', '-m'], check=False, cwd=self.checkout_path)
     for file_record in output:
       if file_record[b'code'] == b'stat':
         file_list.append(file_record[b'clientFile'])
@@ -1629,9 +1629,10 @@ class P4Wrapper(SCMWrapper):
     parsed_url = scm_p4.parse_workspace_url(self.url)
     revision = options.revision or parsed_url.changelist
 
-    args = ['sync']
     if options.force or options.reset:
-      args += ['-f']
+      self.context.run_marshalled(['revert', '//...'], check=True, cwd=self.checkout_path)
+
+    args = ['sync']
     if revision and revision != 'unmanaged':
         args += [f'@{revision}']
 
