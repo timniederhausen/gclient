@@ -1135,7 +1135,7 @@ class GitWrapper(SCMWrapper):
     try:
       self._Capture(['rev-list', '-n', '1', 'HEAD'])
     except subprocess2.CalledProcessError as e:
-      if (b'fatal: bad object HEAD' in e.stderr
+      if options.force or (b'fatal: bad object HEAD' in e.stderr
           and self.cache_dir and self.cache_dir in url):
         self.Print((
           'Likely due to DEPS change with git cache_dir, '
