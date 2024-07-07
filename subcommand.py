@@ -46,7 +46,6 @@ import textwrap
 
 def usage(more):
     """Adds a 'usage_more' property to a CMD function."""
-
     def hook(fn):
         fn.usage_more = more
         return fn
@@ -57,9 +56,8 @@ def usage(more):
 def epilog(text):
     """Adds an 'epilog' property to a CMD function.
 
-  It will be shown in the epilog. Usually useful for examples.
-  """
-
+    It will be shown in the epilog. Usually useful for examples.
+    """
     def hook(fn):
         fn.epilog = text
         return fn
@@ -69,8 +67,8 @@ def epilog(text):
 
 def CMDhelp(parser, args):
     """Prints list of commands or help for a specific command."""
-    # This is the default help implementation. It can be disabled or overridden if
-    # wanted.
+    # This is the default help implementation. It can be disabled or overridden
+    # if wanted.
     if not any(i in ('-h', '--help') for i in args):
         args = args + ['--help']
     parser.parse_args(args)
@@ -81,8 +79,8 @@ def CMDhelp(parser, args):
 def _get_color_module():
     """Returns the colorama module if available.
 
-  If so, assumes colors are supported and return the module handle.
-  """
+    If so, assumes colors are supported and return the module handle.
+    """
     return sys.modules.get('colorama') or sys.modules.get(
         'third_party.colorama')
 
@@ -93,33 +91,34 @@ def _function_to_name(name):
 
 
 class CommandDispatcher(object):
-
     def __init__(self, module):
-        """module is the name of the main python module where to look for commands.
+        """module is the name of the main python module where to look for
+        commands.
 
-    The python builtin variable __name__ MUST be used for |module|. If the
-    script is executed in the form 'python script.py', __name__ == '__main__'
-    and sys.modules['script'] doesn't exist. On the other hand if it is unit
-    tested, __main__ will be the unit test's module so it has to reference to
-    itself with 'script'. __name__ always match the right value.
-    """
+        The python builtin variable __name__ MUST be used for |module|. If the
+        script is executed in the form 'python script.py',
+        __name__ == '__main__' and sys.modules['script'] doesn't exist. On the
+        other hand if it is unit tested, __main__ will be the unit test's
+        module so it has to reference to itself with 'script'. __name__ always
+        match the right value.
+        """
         self.module = sys.modules[module]
 
     def enumerate_commands(self):
         """Returns a dict of command and their handling function.
 
-    The commands must be in the '__main__' modules. To import a command from a
-    submodule, use:
-      from mysubcommand import CMDfoo
+        The commands must be in the '__main__' modules. To import a command
+        from a submodule, use:
+            from mysubcommand import CMDfoo
 
-    Automatically adds 'help' if not already defined.
+        Automatically adds 'help' if not already defined.
 
-    Normalizes '_' in the commands to '-'.
+        Normalizes '_' in the commands to '-'.
 
-    A command can be effectively disabled by defining a global variable to None,
-    e.g.:
-      CMDhelp = None
-    """
+        A command can be effectively disabled by defining a global variable to
+        None, e.g.:
+            CMDhelp = None
+        """
         cmds = dict((_function_to_name(name), getattr(self.module, name))
                     for name in dir(self.module) if name.startswith('CMD'))
         cmds.setdefault('help', CMDhelp)
@@ -128,9 +127,9 @@ class CommandDispatcher(object):
     def find_nearest_command(self, name_asked):
         """Retrieves the function to handle a command as supplied by the user.
 
-    It automatically tries to guess the _intended command_ by handling typos
-    and/or incomplete names.
-    """
+        It automatically tries to guess the _intended command_ by handling typos
+        and/or incomplete names.
+        """
         commands = self.enumerate_commands()
         name_to_dash = name_asked.replace('_', '-')
         if name_to_dash in commands:
@@ -185,16 +184,16 @@ class CommandDispatcher(object):
         cmd_name = _function_to_name(command.__name__)
         if cmd_name == 'help':
             cmd_name = '<command>'
-            # Use the module's docstring as the description for the 'help' command if
-            # available.
+            # Use the module's docstring as the description for the 'help'
+            # command if available.
             parser.description = (self.module.__doc__ or '').rstrip()
             if parser.description:
                 parser.description += '\n\n'
             parser.description += self._gen_commands_list()
             # Do not touch epilog.
         else:
-            # Use the command's docstring if available. For commands, unlike module
-            # docstring, realign.
+            # Use the command's docstring if available. For commands, unlike
+            # module docstring, realign.
             lines = (command.__doc__ or '').rstrip().splitlines()
             if lines[:1]:
                 rest = textwrap.dedent('\n'.join(lines[1:]))
@@ -227,8 +226,8 @@ class CommandDispatcher(object):
     def execute(self, parser, args):
         """Dispatches execution to the right command.
 
-    Fallbacks to 'help' if not disabled.
-    """
+        Fallbacks to 'help' if not disabled.
+        """
         # Unconditionally disable format_description() and format_epilog().
         # Technically, a formatter should be used but it's not worth (yet) the
         # trouble.
@@ -237,19 +236,20 @@ class CommandDispatcher(object):
 
         if args:
             if args[0] in ('-h', '--help') and len(args) > 1:
-                # Reverse the argument order so 'tool --help cmd' is rewritten to
-                # 'tool cmd --help'.
+                # Reverse the argument order so 'tool --help cmd' is rewritten
+                # to 'tool cmd --help'.
                 args = [args[1], args[0]] + args[2:]
             command = self.find_nearest_command(args[0])
             if command:
                 if command.__name__ == 'CMDhelp' and len(args) > 1:
-                    # Reverse the argument order so 'tool help cmd' is rewritten to
-                    # 'tool cmd --help'. Do it here since we want 'tool help cmd' to work
-                    # too.
+                    # Reverse the argument order so 'tool help cmd' is rewritten
+                    # to 'tool cmd --help'. Do it here since we want 'tool help
+                    # cmd' to work too.
                     args = [args[1], '--help'] + args[2:]
                     command = self.find_nearest_command(args[0]) or command
 
-                # "fix" the usage and the description now that we know the subcommand.
+                # "fix" the usage and the description now that we know the
+                # subcommand.
                 self._add_command_usage(parser, command)
                 return command(parser, args[1:])
 
@@ -257,8 +257,8 @@ class CommandDispatcher(object):
         if cmdhelp:
             # Not a known command. Default to help.
             self._add_command_usage(parser, cmdhelp)
-            # Don't pass list of arguments as those may not be supported by cmdhelp.
-            # See: https://crbug.com/1352093
+            # Don't pass list of arguments as those may not be supported by
+            # cmdhelp. See: https://crbug.com/1352093
             return cmdhelp(parser, [])
 
         # Nothing can be done.

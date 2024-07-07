@@ -8,15 +8,19 @@
 # particularly for modules that are not builtin (see sys.builtin_modules_names,
 # os isn't built in, but it's essential to this file).
 
-from __future__ import print_function
-
-import gclient_utils
+import functools
 import logging
 import os
-import subprocess2
 import sys
 
+import gclient_utils
+import subprocess2
 
+# TODO: Should fix these warnings.
+# pylint: disable=line-too-long
+
+
+@functools.lru_cache
 def FindGclientRoot(from_dir, filename='.gclient'):
     """Tries to find the gclient root."""
     real_from_dir = os.path.abspath(from_dir)
@@ -32,8 +36,8 @@ def FindGclientRoot(from_dir, filename='.gclient'):
     if path == real_from_dir:
         return path
 
-    # If we did not find the file in the current directory, make sure we are in a
-    # sub directory that is controlled by this configuration.
+    # If we did not find the file in the current directory, make sure we are in
+    # a sub directory that is controlled by this configuration.
     entries_filename = os.path.join(path, filename + '_entries')
     if not os.path.exists(entries_filename):
         # If .gclient_entries does not exist, a previous call to gclient sync
@@ -53,8 +57,12 @@ def FindGclientRoot(from_dir, filename='.gclient'):
     except (SyntaxError, Exception) as e:
         gclient_utils.SyntaxErrorToError(filename, e)
 
-    all_directories = scope['entries'].keys()
-    path_to_check = os.path.relpath(real_from_dir, path)
+    all_directories = set(
+        os.path.relpath(os.path.realpath(os.path.join(path, *k.split('/'))),
+                        start=os.path.realpath(path))
+        for k in scope['entries'].keys())
+    path_to_check = os.path.relpath(os.path.realpath(real_from_dir),
+                                    start=os.path.realpath(path))
     while path_to_check:
         if path_to_check in all_directories:
             return path
@@ -63,10 +71,9 @@ def FindGclientRoot(from_dir, filename='.gclient'):
     return None
 
 
-def GetPrimarySolutionPath():
-    """Returns the full path to the primary solution. (gclient_root + src)"""
-
-    gclient_root = FindGclientRoot(os.getcwd())
+@functools.lru_cache
+def _GetPrimarySolutionPathInternal(cwd):
+    gclient_root = FindGclientRoot(cwd)
     if gclient_root:
         # Some projects' top directory is not named 'src'.
         source_dir_name = GetGClientPrimarySolutionName(gclient_root) or 'src'
@@ -74,12 +81,11 @@ def GetPrimarySolutionPath():
 
     # Some projects might not use .gclient. Try to see whether we're in a git
     # checkout that contains a 'buildtools' subdir.
-    top_dir = os.getcwd()
+    top_dir = cwd
     try:
         top_dir = subprocess2.check_output(
             ['git', 'rev-parse', '--show-toplevel'], stderr=subprocess2.DEVNULL)
-        if sys.version_info.major == 3:
-            top_dir = top_dir.decode('utf-8', 'replace')
+        top_dir = top_dir.decode('utf-8', 'replace')
         top_dir = os.path.normpath(top_dir.strip())
     except subprocess2.CalledProcessError:
         pass
@@ -89,13 +95,13 @@ def GetPrimarySolutionPath():
     return None
 
 
-def GetBuildtoolsPath():
-    """Returns the full path to the buildtools directory.
-  This is based on the root of the checkout containing the current directory."""
+def GetPrimarySolutionPath():
+    """Returns the full path to the primary solution. (gclient_root + src)"""
+    return _GetPrimarySolutionPathInternal(os.getcwd())
 
-    # Overriding the build tools path by environment is highly unsupported and may
-    # break without warning.  Do not rely on this for anything important.
-    override = os.environ.get('CHROMIUM_BUILDTOOLS_PATH')
+
+@functools.lru_cache
+def _GetBuildtoolsPathInternal(cwd, override):
     if override is not None:
         return override
 
@@ -114,6 +120,15 @@ def GetBuildtoolsPath():
         return buildtools_path
 
     return None
+
+
+def GetBuildtoolsPath():
+    """Returns the full path to the buildtools directory.
+  This is based on the root of the checkout containing the current directory."""
+    # Overriding the build tools path by environment is highly unsupported and
+    # may break without warning.  Do not rely on this for anything important.
+    override = os.environ.get('CHROMIUM_BUILDTOOLS_PATH')
+    return _GetBuildtoolsPathInternal(os.getcwd(), override)
 
 
 def GetBuildtoolsPlatformBinaryPath():
@@ -140,6 +155,7 @@ def GetExeSuffix():
     return ''
 
 
+@functools.lru_cache
 def GetGClientPrimarySolutionName(gclient_root_dir_path):
     """Returns the name of the primary solution in the .gclient file specified."""
     gclient_config_file = os.path.join(gclient_root_dir_path, '.gclient')

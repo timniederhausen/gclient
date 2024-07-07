@@ -3,70 +3,31 @@
 # found in the LICENSE file.
 """SCM-specific utility classes."""
 
-import distutils.version
-import glob
-import io
+from collections import defaultdict
 import os
+import pathlib
 import platform
 import re
-import sys
+from typing import Mapping, List
 
 import gclient_utils
+import git_common
 import subprocess2
 
+# TODO: Should fix these warnings.
+# pylint: disable=line-too-long
 
-def ValidateEmail(email):
-    return (re.match(r"^[a-zA-Z0-9._%\-+]+@[a-zA-Z0-9._%-]+.[a-zA-Z]{2,6}$",
-                     email) is not None)
-
-
-def GetCasedPath(path):
-    """Elcheapos way to get the real path case on Windows."""
-    if sys.platform.startswith('win') and os.path.exists(path):
-        # Reconstruct the path.
-        path = os.path.abspath(path)
-        paths = path.split('\\')
-        for i in range(len(paths)):
-            if i == 0:
-                # Skip drive letter.
-                continue
-            subpath = '\\'.join(paths[:i + 1])
-            prev = len('\\'.join(paths[:i]))
-            # glob.glob will return the cased path for the last item only. This is why
-            # we are calling it in a loop. Extract the data we want and put it back
-            # into the list.
-            paths[i] = glob.glob(subpath + '*')[0][prev + 1:len(subpath)]
-        path = '\\'.join(paths)
-    return path
-
-
-def GenFakeDiff(filename):
-    """Generates a fake diff from a file."""
-    file_content = gclient_utils.FileRead(filename, 'rb').splitlines(True)
-    filename = filename.replace(os.sep, '/')
-    nb_lines = len(file_content)
-    # We need to use / since patch on unix will fail otherwise.
-    data = io.StringIO()
-    data.write("Index: %s\n" % filename)
-    data.write('=' * 67 + '\n')
-    # Note: Should we use /dev/null instead?
-    data.write("--- %s\n" % filename)
-    data.write("+++ %s\n" % filename)
-    data.write("@@ -0,0 +1,%d @@\n" % nb_lines)
-    # Prepend '+' to every lines.
-    for line in file_content:
-        data.write('+')
-        data.write(line)
-    result = data.getvalue()
-    data.close()
-    return result
+# constants used to identify the tree state of a directory.
+VERSIONED_NO = 0
+VERSIONED_DIR = 1
+VERSIONED_SUBMODULE = 2
 
 
 def determine_scm(root):
     """Similar to upload.py's version but much simpler.
 
-  Returns 'git' or None.
-  """
+    Returns 'git' or 'diff'.
+    """
     if os.path.isdir(os.path.join(root, '.git')):
         return 'git'
 
@@ -77,30 +38,67 @@ def determine_scm(root):
                                cwd=root)
         return 'git'
     except (OSError, subprocess2.CalledProcessError):
-        return None
-
-
-def only_int(val):
-    if val.isdigit():
-        return int(val)
-
-    return 0
+        return 'diff'
 
 
 class GIT(object):
     current_version = None
+    rev_parse_cache = {}
+
+    # Maps cwd -> {config key, [config values]}
+    # This cache speeds up all `git config ...` operations by only running a
+    # single subcommand, which can greatly accelerate things like
+    # git-map-branches.
+    _CONFIG_CACHE: Mapping[str, Mapping[str, List[str]]] = {}
+
+    @staticmethod
+    def _load_config(cwd: str) -> Mapping[str, List[str]]:
+        """Loads git config for the given cwd.
+
+        The calls to this method are cached in-memory for performance. The
+        config is only reloaded on cache misses.
+
+        Args:
+            cwd: path to fetch `git config` for.
+
+        Returns:
+            A dict mapping git config keys to a list of its values.
+        """
+        if cwd not in GIT._CONFIG_CACHE:
+            try:
+                rawConfig = GIT.Capture(['config', '--list', '-z'],
+                                        cwd=cwd,
+                                        strip_out=False)
+            except subprocess2.CalledProcessError:
+                return {}
+
+            cfg = defaultdict(list)
+
+            # Splitting by '\x00' gets an additional empty string at the end.
+            for line in rawConfig.split('\x00')[:-1]:
+                key, value = map(str.strip, line.split('\n', 1))
+                cfg[key].append(value)
+
+            GIT._CONFIG_CACHE[cwd] = cfg
+
+        return GIT._CONFIG_CACHE[cwd]
+
+    @staticmethod
+    def _clear_config(cwd: str) -> None:
+        GIT._CONFIG_CACHE.pop(cwd, None)
+
 
     @staticmethod
     def ApplyEnvVars(kwargs):
         env = kwargs.pop('env', None) or os.environ.copy()
         # Don't prompt for passwords; just fail quickly and noisily.
-        # By default, git will use an interactive terminal prompt when a username/
-        # password is needed.  That shouldn't happen in the chromium workflow,
-        # and if it does, then gclient may hide the prompt in the midst of a flood
-        # of terminal spew.  The only indication that something has gone wrong
-        # will be when gclient hangs unresponsively.  Instead, we disable the
-        # password prompt and simply allow git to fail noisily.  The error
-        # message produced by git will be copied to gclient's output.
+        # By default, git will use an interactive terminal prompt when a
+        # username/ password is needed.  That shouldn't happen in the chromium
+        # workflow, and if it does, then gclient may hide the prompt in the
+        # midst of a flood of terminal spew.  The only indication that something
+        # has gone wrong will be when gclient hangs unresponsively.  Instead, we
+        # disable the password prompt and simply allow git to fail noisily.  The
+        # error message produced by git will be copied to gclient's output.
         env.setdefault('GIT_ASKPASS', 'true')
         env.setdefault('SSH_ASKPASS', 'true')
         # 'cat' is a magical git string that disables pagers on all platforms.
@@ -109,39 +107,42 @@ class GIT(object):
 
     @staticmethod
     def Capture(args, cwd=None, strip_out=True, **kwargs):
-        env = GIT.ApplyEnvVars(kwargs)
-        output = subprocess2.check_output(['git'] + args,
-                                          cwd=cwd,
-                                          stderr=subprocess2.PIPE,
-                                          env=env,
-                                          **kwargs)
-        output = output.decode('utf-8', 'replace')
-        return output.strip() if strip_out else output
+        kwargs.setdefault('env', GIT.ApplyEnvVars(kwargs))
+        kwargs.setdefault('cwd', cwd)
+        kwargs.setdefault('autostrip', strip_out)
+        return git_common.run(*args, **kwargs)
 
     @staticmethod
-    def CaptureStatus(cwd, upstream_branch, end_commit=None):
+    def CaptureStatus(cwd,
+                      upstream_branch,
+                      end_commit=None,
+                      ignore_submodules=True):
         # type: (str, str, Optional[str]) -> Sequence[Tuple[str, str]]
         """Returns git status.
 
-    Returns an array of (status, file) tuples."""
+        Returns an array of (status, file) tuples."""
         if end_commit is None:
             end_commit = ''
         if upstream_branch is None:
             upstream_branch = GIT.GetUpstreamBranch(cwd)
             if upstream_branch is None:
                 raise gclient_utils.Error('Cannot determine upstream branch')
+
         command = [
             '-c', 'core.quotePath=false', 'diff', '--name-status',
-            '--no-renames', '-r',
-            '%s...%s' % (upstream_branch, end_commit)
+            '--no-renames'
         ]
+        if ignore_submodules:
+            command.append('--ignore-submodules=all')
+        command.extend(['-r', '%s...%s' % (upstream_branch, end_commit)])
+
         status = GIT.Capture(command, cwd)
         results = []
         if status:
             for statusline in status.splitlines():
-                # 3-way merges can cause the status can be 'MMM' instead of 'M'. This
-                # can happen when the user has 2 local branches and he diffs between
-                # these 2 branches instead diffing to upstream.
+                # 3-way merges can cause the status can be 'MMM' instead of 'M'.
+                # This can happen when the user has 2 local branches and he
+                # diffs between these 2 branches instead diffing to upstream.
                 m = re.match(r'^(\w)+\t(.+)$', statusline)
                 if not m:
                     raise gclient_utils.Error(
@@ -152,10 +153,28 @@ class GIT(object):
 
     @staticmethod
     def GetConfig(cwd, key, default=None):
-        try:
-            return GIT.Capture(['config', key], cwd=cwd)
-        except subprocess2.CalledProcessError:
+        values = GIT._load_config(cwd).get(key, None)
+        if not values:
             return default
+
+        return values[-1]
+
+    @staticmethod
+    def GetConfigBool(cwd, key) -> bool:
+        return GIT.GetConfig(cwd, key) == 'true'
+
+    @staticmethod
+    def GetConfigList(cwd, key):
+        return GIT._load_config(cwd).get(key, [])
+
+    @staticmethod
+    def YieldConfigRegexp(cwd, pattern):
+        """Yields (key, value) pairs for any config keys matching `pattern`."""
+        p = re.compile(pattern)
+        for name, values in GIT._load_config(cwd).items():
+            if p.match(name):
+                for value in values:
+                    yield name, value
 
     @staticmethod
     def GetBranchConfig(cwd, branch, key, default=None):
@@ -164,27 +183,66 @@ class GIT(object):
         return GIT.GetConfig(cwd, key, default)
 
     @staticmethod
-    def SetConfig(cwd, key, value=None):
-        if value is None:
-            args = ['config', '--unset', key]
+    def SetConfig(
+        cwd,
+        key,
+        value=None,
+        *,
+        append=False,
+        missing_ok=True,
+        modify_all=False,
+        scope='local',
+        value_pattern=None,
+    ):
+        """Sets or unsets one or more config values.
+
+        Args:
+            cwd: path to set `git config` for.
+            key: The specific config key to affect.
+            value: The value to set. If this is None, `key` will be unset.
+            append: If True and `value` is not None, this will append
+                the value instead of replacing an existing one.
+            missing_ok: If `value` is None (i.e. this is an unset operation),
+                ignore retcode=5 from `git config` (meaning that the value is
+                not present). If `value` is not None, then this option has no
+                effect.
+            modify_all: If True, this will change a set operation to
+                `--replace-all`, and will change an unset operation to
+                `--unset-all`.
+            scope: By default this is the local scope, but could be `system`,
+                `global`, or `worktree`, depending on which config scope you
+                want to affect.
+            value_pattern: For use with `modify_all=True`, allows
+                further filtering of the set or unset operation based on
+                the currently configured value. Ignored for
+                `modify_all=False`.
+        """
+        GIT._clear_config(cwd)
+
+        args = ['config', f'--{scope}']
+        if value == None:
+            args.extend(['--unset' + ('-all' if modify_all else ''), key])
         else:
-            args = ['config', key, value]
-        GIT.Capture(args, cwd=cwd)
+            if modify_all:
+                args.append('--replace-all')
+            if append:
+                args.append('--add')
+            args.extend([key, value])
+
+        if modify_all and value_pattern:
+            args.append(value_pattern)
+
+        accepted_retcodes = [0]
+        if value is None and missing_ok:
+            accepted_retcodes = [0, 5]
+
+        GIT.Capture(args, cwd=cwd, accepted_retcodes=accepted_retcodes)
 
     @staticmethod
     def SetBranchConfig(cwd, branch, key, value=None):
         assert branch, 'A branch must be given'
         key = 'branch.%s.%s' % (branch, key)
         GIT.SetConfig(cwd, key, value)
-
-    @staticmethod
-    def IsWorkTreeDirty(cwd):
-        return GIT.Capture(['status', '-s'], cwd=cwd) != ''
-
-    @staticmethod
-    def GetEmail(cwd):
-        """Retrieves the user email address if known."""
-        return GIT.GetConfig(cwd, 'user.email', '')
 
     @staticmethod
     def ShortBranchName(branch):
@@ -202,7 +260,7 @@ class GIT(object):
     @staticmethod
     def GetRemoteHeadRef(cwd, url, remote):
         """Returns the full default remote branch reference, e.g.
-    'refs/remotes/origin/main'."""
+        'refs/remotes/origin/main'."""
         if os.path.exists(cwd):
             try:
                 # Try using local git copy first
@@ -210,8 +268,12 @@ class GIT(object):
                 ref = GIT.Capture(['symbolic-ref', ref], cwd=cwd)
                 if not ref.endswith('master'):
                     return ref
-                # Check if there are changes in the default branch for this particular
-                # repository.
+            except subprocess2.CalledProcessError:
+                pass
+
+            try:
+                # Check if there are changes in the default branch for this
+                # particular repository.
                 GIT.Capture(['remote', 'set-head', '-a', remote], cwd=cwd)
                 return GIT.Capture(['symbolic-ref', ref], cwd=cwd)
             except subprocess2.CalledProcessError:
@@ -228,7 +290,7 @@ class GIT(object):
         except subprocess2.CalledProcessError:
             pass
         # Return default branch
-        return 'refs/remotes/%s/master' % remote
+        return 'refs/remotes/%s/main' % remote
 
     @staticmethod
     def GetBranch(cwd):
@@ -245,8 +307,8 @@ class GIT(object):
     @staticmethod
     def FetchUpstreamTuple(cwd, branch=None):
         """Returns a tuple containing remote and remote ref,
-       e.g. 'origin', 'refs/heads/main'
-    """
+        e.g. 'origin', 'refs/heads/main'
+        """
         try:
             branch = branch or GIT.GetBranch(cwd)
         except subprocess2.CalledProcessError:
@@ -278,14 +340,14 @@ class GIT(object):
     def RefToRemoteRef(ref, remote):
         """Convert a checkout ref to the equivalent remote ref.
 
-    Returns:
-      A tuple of the remote ref's (common prefix, unique suffix), or None if it
-      doesn't appear to refer to a remote ref (e.g. it's a commit hash).
-    """
-        # TODO(mmoss): This is just a brute-force mapping based of the expected git
-        # config. It's a bit better than the even more brute-force replace('heads',
-        # ...), but could still be smarter (like maybe actually using values gleaned
-        # from the git config).
+        Returns:
+            A tuple of the remote ref's (common prefix, unique suffix), or None if it
+            doesn't appear to refer to a remote ref (e.g. it's a commit hash).
+        """
+        # TODO(mmoss): This is just a brute-force mapping based of the expected
+        # git config. It's a bit better than the even more brute-force
+        # replace('heads', ...), but could still be smarter (like maybe actually
+        # using values gleaned from the git config).
         m = re.match('^(refs/(remotes/)?)?branch-heads/', ref or '')
         if m:
             return ('refs/remotes/branch-heads/', ref.replace(m.group(0), ''))
@@ -352,8 +414,8 @@ class GIT(object):
                      files=None):
         """Diffs against the upstream branch or optionally another branch.
 
-    full_move means that move or copy operations should completely recreate the
-    files, usually in the prospect to apply the patch for a try job."""
+        full_move means that move or copy operations should completely recreate the
+        files, usually in the prospect to apply the patch for a try job."""
         if not branch:
             branch = GIT.GetUpstreamBranch(cwd)
         command = [
@@ -377,38 +439,34 @@ class GIT(object):
         return ''.join(diff)
 
     @staticmethod
-    def GetDifferentFiles(cwd, branch=None, branch_head='HEAD'):
-        """Returns the list of modified files between two branches."""
-        if not branch:
-            branch = GIT.GetUpstreamBranch(cwd)
-        command = [
-            '-c', 'core.quotePath=false', 'diff', '--name-only',
-            branch + "..." + branch_head
-        ]
-        return GIT.Capture(command, cwd=cwd).splitlines(False)
-
-    @staticmethod
     def GetAllFiles(cwd):
         """Returns the list of all files under revision control."""
         command = ['-c', 'core.quotePath=false', 'ls-files', '--', '.']
         return GIT.Capture(command, cwd=cwd).splitlines(False)
 
     @staticmethod
-    def GetPatchName(cwd):
-        """Constructs a name for this patch."""
-        short_sha = GIT.Capture(['rev-parse', '--short=4', 'HEAD'], cwd=cwd)
-        return "%s#%s" % (GIT.GetBranch(cwd), short_sha)
+    def GetSubmoduleCommits(cwd, submodules):
+        # type: (string, List[string]) => Mapping[string][string]
+        """Returns a mapping of staged or committed new commits for submodules."""
+        if not submodules:
+            return {}
+        result = subprocess2.check_output(['git', 'ls-files', '-s', '--'] +
+                                          submodules,
+                                          cwd=cwd).decode('utf-8')
+        commit_hashes = {}
+        for r in result.splitlines():
+            # ['<mode>', '<commit_hash>', '<stage_number>', '<path>'].
+            record = r.strip().split(maxsplit=3)  # path can contain spaces.
+            assert record[0] == '160000', 'file is not a gitlink: %s' % record
+            commit_hashes[record[3]] = record[1]
+        return commit_hashes
 
     @staticmethod
     def GetCheckoutRoot(cwd):
         """Returns the top level directory of a git checkout as an absolute path.
-    """
+        """
         root = GIT.Capture(['rev-parse', '--show-cdup'], cwd=cwd)
         return os.path.abspath(os.path.join(cwd, root))
-
-    @staticmethod
-    def GetGitDir(cwd):
-        return os.path.abspath(GIT.Capture(['rev-parse', '--git-dir'], cwd=cwd))
 
     @staticmethod
     def IsInsideWorkTree(cwd):
@@ -418,9 +476,32 @@ class GIT(object):
             return False
 
     @staticmethod
-    def IsDirectoryVersioned(cwd, relative_dir):
+    def IsVersioned(cwd, relative_dir):
+        # type: (str, str) -> int
         """Checks whether the given |relative_dir| is part of cwd's repo."""
-        return bool(GIT.Capture(['ls-tree', 'HEAD', relative_dir], cwd=cwd))
+        output = GIT.Capture(['ls-tree', 'HEAD', '--', relative_dir], cwd=cwd)
+        if not output:
+            return VERSIONED_NO
+        if output.startswith('160000'):
+            return VERSIONED_SUBMODULE
+        return VERSIONED_DIR
+
+    @staticmethod
+    def ListSubmodules(repo_root):
+        # type: (str) -> Collection[str]
+        """Returns the list of submodule paths for the given repo.
+
+        Path separators will be adjusted for the current OS.
+        """
+        if not os.path.exists(os.path.join(repo_root, '.gitmodules')):
+            return []
+        config_output = GIT.Capture(
+            ['config', '--file', '.gitmodules', '--get-regexp', 'path'],
+            cwd=repo_root)
+        return [
+            line.split()[-1].replace('/', os.path.sep)
+            for line in config_output.splitlines()
+        ]
 
     @staticmethod
     def CleanupDir(cwd, relative_dir):
@@ -429,40 +510,70 @@ class GIT(object):
 
     @staticmethod
     def ResolveCommit(cwd, rev):
-        # We do this instead of rev-parse --verify rev^{commit}, since on Windows
-        # git can be either an executable or batch script, each of which requires
-        # escaping the caret (^) a different way.
+        cache_key = None
+        # We do this instead of rev-parse --verify rev^{commit}, since on
+        # Windows git can be either an executable or batch script, each of which
+        # requires escaping the caret (^) a different way.
         if gclient_utils.IsFullGitSha(rev):
-            # git-rev parse --verify FULL_GIT_SHA always succeeds, even if we don't
-            # have FULL_GIT_SHA locally. Removing the last character forces git to
-            # check if FULL_GIT_SHA refers to an object in the local database.
+            # Only cache full SHAs
+            cache_key = hash(cwd + rev)
+            if val := GIT.rev_parse_cache.get(cache_key):
+                return val
+
+            # git-rev parse --verify FULL_GIT_SHA always succeeds, even if we
+            # don't have FULL_GIT_SHA locally. Removing the last character
+            # forces git to check if FULL_GIT_SHA refers to an object in the
+            # local database.
             rev = rev[:-1]
-        try:
-            return GIT.Capture(['rev-parse', '--quiet', '--verify', rev],
-                               cwd=cwd)
-        except subprocess2.CalledProcessError:
-            return None
+        res = GIT.Capture(['rev-parse', '--quiet', '--verify', rev], cwd=cwd)
+        if cache_key:
+            # We don't expect concurrent execution, so we don't lock anything.
+            GIT.rev_parse_cache[cache_key] = res
+
+        return res
 
     @staticmethod
     def IsValidRevision(cwd, rev, sha_only=False):
         """Verifies the revision is a proper git revision.
 
-    sha_only: Fail unless rev is a sha hash.
-    """
-        sha = GIT.ResolveCommit(cwd, rev)
-        if sha is None:
-            return False
+        sha_only: Fail unless rev is a sha hash.
+        """
+        try:
+            sha = GIT.ResolveCommit(cwd, rev)
+        except subprocess2.CalledProcessError:
+            return None
+
         if sha_only:
             return sha == rev.lower()
         return True
 
-    @classmethod
-    def AssertVersion(cls, min_version):
-        """Asserts git's version is at least min_version."""
-        if cls.current_version is None:
-            current_version = cls.Capture(['--version'], '.')
-            matched = re.search(r'git version (.+)', current_version)
-            cls.current_version = distutils.version.LooseVersion(
-                matched.group(1))
-        min_version = distutils.version.LooseVersion(min_version)
-        return (min_version <= cls.current_version, cls.current_version)
+
+class DIFF(object):
+
+    @staticmethod
+    def GetAllFiles(cwd):
+        """Return all files under the repo at cwd.
+
+        If .gitmodules exists in cwd, use it to determine which folders are
+        submodules and don't recurse into them. Submodule paths are returned.
+        """
+        # `git config --file` works outside of a git workspace.
+        submodules = GIT.ListSubmodules(cwd)
+        if not submodules:
+            return [
+                str(p.relative_to(cwd)) for p in pathlib.Path(cwd).rglob("*")
+                if p.is_file()
+            ]
+
+        full_path_submodules = {os.path.join(cwd, s) for s in submodules}
+
+        def should_recurse(dirpath, dirname):
+            full_path = os.path.join(dirpath, dirname)
+            return full_path not in full_path_submodules
+
+        paths = list(full_path_submodules)
+        for dirpath, dirnames, filenames in os.walk(cwd):
+            paths.extend([os.path.join(dirpath, f) for f in filenames])
+            dirnames[:] = [d for d in dirnames if should_recurse(dirpath, d)]
+
+        return [os.path.relpath(p, cwd) for p in paths]

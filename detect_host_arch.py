@@ -4,12 +4,12 @@
 # found in the LICENSE file.
 """Outputs host CPU architecture in format recognized by gyp."""
 
-from __future__ import print_function
-
+from functools import lru_cache
 import platform
 import re
 
 
+@lru_cache(maxsize=None)
 def HostArch():
     """Returns the host architecture with a predictable string."""
     host_arch = platform.machine().lower()
@@ -34,14 +34,17 @@ def HostArch():
         host_arch = 's390'
     elif host_arch.startswith('riscv'):
         host_arch = 'riscv64'
+    elif platform.system() == 'OS/390':
+        host_arch = 's390x'
 
     if host_arch == 'arm64':
         host_platform = platform.architecture()
         if len(host_platform) > 1:
             if host_platform[1].lower() == 'windowspe':
-                # Special case for Windows on Arm: windows-386 packages no longer work
-                # so use the x64 emulation (this restricts us to Windows 11). Python
-                # 32-bit returns the host_arch as arm64, 64-bit does not.
+                # Special case for Windows on Arm: windows-386 packages no
+                # longer work so use the x64 emulation (this restricts us to
+                # Windows 11). Python 32-bit returns the host_arch as arm64,
+                # 64-bit does not.
                 return 'x64'
 
     # platform.machine is based on running kernel. It's possible to use 64-bit
@@ -58,7 +61,7 @@ def HostArch():
 
 def DoMain(_):
     """Hook to be called from gyp without starting a separate python
-  interpreter."""
+    interpreter."""
     return HostArch()
 
 

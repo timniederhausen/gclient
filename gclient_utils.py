@@ -3,8 +3,6 @@
 # found in the LICENSE file.
 """Generic utils."""
 
-from __future__ import print_function
-
 import codecs
 import collections
 import contextlib
@@ -15,27 +13,19 @@ import io
 import logging
 import operator
 import os
-import pipes
 import platform
+import queue
 import re
+import shlex
 import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-import subprocess2
+import urllib.parse
 
-if sys.version_info.major == 2:
-    from cStringIO import StringIO
-    import collections as collections_abc
-    import Queue as queue
-    import urlparse
-else:
-    from collections import abc as collections_abc
-    from io import StringIO
-    import queue
-    import urllib.parse as urlparse
+import subprocess2
 
 # Git wrapper retries on a transient error, and some callees do retries too,
 # such as GitWrapper.update (doing clone). One retry attempt should be
@@ -52,25 +42,21 @@ _WARNINGS = []
 THREADED_INDEX_PACK_BLOCKLIST = [
     'https://chromium.googlesource.com/chromium/reference_builds/chrome_win.git'
 ]
-"""To support rethrowing exceptions with tracebacks on both Py2 and 3."""
-if sys.version_info.major == 2:
-    # We have to use exec to avoid a SyntaxError in Python 3.
-    exec("def reraise(typ, value, tb=None):\n  raise typ, value, tb\n")
-else:
 
-    def reraise(typ, value, tb=None):
-        if value is None:
-            value = typ()
-        if value.__traceback__ is not tb:
-            raise value.with_traceback(tb)
-        raise value
+
+def reraise(typ, value, tb=None):
+    """To support rethrowing exceptions with tracebacks."""
+    if value is None:
+        value = typ()
+    if value.__traceback__ is not tb:
+        raise value.with_traceback(tb)
+    raise value
 
 
 class Error(Exception):
     """gclient exception class."""
-
     def __init__(self, msg, *args, **kwargs):
-        index = getattr(threading.currentThread(), 'index', 0)
+        index = getattr(threading.current_thread(), 'index', 0)
         if index:
             msg = '\n'.join('%d> %s' % (index, l) for l in msg.splitlines())
         super(Error, self).__init__(msg, *args, **kwargs)
@@ -99,14 +85,15 @@ def FuzzyMatchRepo(repo, candidates):
     # type: (str, Union[Collection[str], Mapping[str, Any]]) -> Optional[str]
     """Attempts to find a representation of repo in the candidates.
 
-  Args:
-    repo: a string representation of a repo in the form of a url or the
-      name and path of the solution it represents.
-    candidates: The candidates to look through which may contain `repo` in
-      in any of the forms mentioned above.
-  Returns:
-    The matching string, if any, which may be in a different form from `repo`.
-  """
+    Args:
+        repo: a string representation of a repo in the form of a url or the
+            name and path of the solution it represents.
+        candidates: The candidates to look through which may contain `repo` in
+            in any of the forms mentioned above.
+    Returns:
+        The matching string, if any, which may be in a different form from
+        `repo`.
+    """
     if repo in candidates:
         return repo
     if repo.endswith('.git') and repo[:-len('.git')] in candidates:
@@ -117,7 +104,7 @@ def FuzzyMatchRepo(repo, candidates):
 
 
 def SplitUrlRevision(url):
-    """Splits url and returns a two-tuple: url, rev"""
+    """Splits url and returns a two-tuple: url, rev."""
     if url.startswith('ssh:'):
         # Make sure ssh://user-name@example.com/~/test.git@stable works
         regex = r'(ssh://(?:[-.\w]+@)?[-\w:\.]+/[-~\w\./]+)(?:@(.+))?'
@@ -143,12 +130,12 @@ def ExtractRefName(remote, full_refs_str):
 
 
 def IsGitSha(revision):
-    """Returns true if the given string is a valid hex-encoded sha"""
+    """Returns true if the given string is a valid hex-encoded sha."""
     return re.match('^[a-fA-F0-9]{6,40}$', revision) is not None
 
 
 def IsFullGitSha(revision):
-    """Returns true if the given string is a valid hex-encoded full sha"""
+    """Returns true if the given string is a valid hex-encoded full sha."""
     return re.match('^[a-fA-F0-9]{40}$', revision) is not None
 
 
@@ -159,12 +146,12 @@ def IsDateRevision(revision):
 
 def MakeDateRevision(date):
     """Returns a revision representing the latest revision before the given
-  date."""
+    date."""
     return "{" + date + "}"
 
 
 def SyntaxErrorToError(filename, e):
-    """Raises a gclient_utils.Error exception with the human readable message"""
+    """Raises a gclient_utils.Error exception with a human readable message."""
     try:
         # Try to construct a human readable error message
         if filename:
@@ -181,7 +168,6 @@ def SyntaxErrorToError(filename, e):
 
 
 class PrintableObject(object):
-
     def __str__(self):
         output = ''
         for i in dir(self):
@@ -197,14 +183,12 @@ def AskForData(message):
     try:
         import readline
     except ImportError:
-        # The readline module does not exist in all Python distributions, e.g. on
-        # Windows. Fall back to simple input handling.
+        # The readline module does not exist in all Python distributions, e.g.
+        # on Windows. Fall back to simple input handling.
         pass
 
-    # Use this so that it can be mocked in tests on Python 2 and 3.
+    # Use this so that it can be mocked in tests.
     try:
-        if sys.version_info.major == 2:
-            return raw_input(message)
         return input(message)
     except KeyboardInterrupt:
         # Hide the exception.
@@ -240,23 +224,23 @@ def temporary_directory(**kwargs):
 def temporary_file():
     """Creates a temporary file.
 
-  On Windows, a file must be closed before it can be opened again. This function
-  allows to write something like:
+    On Windows, a file must be closed before it can be opened again. This
+    function allows to write something like:
 
-    with gclient_utils.temporary_file() as tmp:
-      gclient_utils.FileWrite(tmp, foo)
-      useful_stuff(tmp)
+        with gclient_utils.temporary_file() as tmp:
+            gclient_utils.FileWrite(tmp, foo)
+            useful_stuff(tmp)
 
-  Instead of something like:
+    Instead of something like:
 
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-      tmp.write(foo)
-      tmp.close()
-      try:
-        useful_stuff(tmp)
-      finally:
-        os.remove(tmp.name)
-  """
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp.write(foo)
+            tmp.close()
+            try:
+                useful_stuff(tmp)
+            finally:
+                os.remove(tmp.name)
+    """
     handle, name = tempfile.mkstemp()
     os.close(handle)
     try:
@@ -268,11 +252,11 @@ def temporary_file():
 def safe_rename(old, new):
     """Renames a file reliably.
 
-  Sometimes os.rename does not work because a dying git process keeps a handle
-  on it for a few seconds. An exception is then thrown, which make the program
-  give up what it was doing and remove what was deleted.
-  The only solution is to catch the exception and try again until it works.
-  """
+    Sometimes os.rename does not work because a dying git process keeps a handle
+    on it for a few seconds. An exception is then thrown, which make the program
+    give up what it was doing and remove what was deleted.
+    The only solution is to catch the exception and try again until it works.
+    """
     # roughly 10s
     retries = 100
     for i in range(retries):
@@ -299,28 +283,28 @@ def rm_file_or_tree(path):
 def rmtree(path):
     """shutil.rmtree() on steroids.
 
-  Recursively removes a directory, even if it's marked read-only.
+    Recursively removes a directory, even if it's marked read-only.
 
-  shutil.rmtree() doesn't work on Windows if any of the files or directories
-  are read-only. We need to be able to force the files to be writable (i.e.,
-  deletable) as we traverse the tree.
+    shutil.rmtree() doesn't work on Windows if any of the files or directories
+    are read-only. We need to be able to force the files to be writable (i.e.,
+    deletable) as we traverse the tree.
 
-  Even with all this, Windows still sometimes fails to delete a file, citing
-  a permission error (maybe something to do with antivirus scans or disk
-  indexing).  The best suggestion any of the user forums had was to wait a
-  bit and try again, so we do that too.  It's hand-waving, but sometimes it
-  works. :/
+    Even with all this, Windows still sometimes fails to delete a file, citing
+    a permission error (maybe something to do with antivirus scans or disk
+    indexing).  The best suggestion any of the user forums had was to wait a
+    bit and try again, so we do that too.  It's hand-waving, but sometimes it
+    works. :/
 
-  On POSIX systems, things are a little bit simpler.  The modes of the files
-  to be deleted doesn't matter, only the modes of the directories containing
-  them are significant.  As the directory tree is traversed, each directory
-  has its mode set appropriately before descending into it.  This should
-  result in the entire tree being removed, with the possible exception of
-  *path itself, because nothing attempts to change the mode of its parent.
-  Doing so would be hazardous, as it's not a directory slated for removal.
-  In the ordinary case, this is not a problem: for our purposes, the user
-  will never lack write permission on *path's parent.
-  """
+    On POSIX systems, things are a little bit simpler.  The modes of the files
+    to be deleted doesn't matter, only the modes of the directories containing
+    them are significant.  As the directory tree is traversed, each directory
+    has its mode set appropriately before descending into it.  This should
+    result in the entire tree being removed, with the possible exception of
+    *path itself, because nothing attempts to change the mode of its parent.
+    Doing so would be hazardous, as it's not a directory slated for removal.
+    In the ordinary case, this is not a problem: for our purposes, the user
+    will never lack write permission on *path's parent.
+    """
     if not os.path.exists(path):
         return
 
@@ -350,9 +334,9 @@ def rmtree(path):
 
     for fn in os.listdir(path):
         # If fullpath is a symbolic link that points to a directory, isdir will
-        # be True, but we don't want to descend into that as a directory, we just
-        # want to remove the link.  Check islink and treat links as ordinary files
-        # would be treated regardless of what they reference.
+        # be True, but we don't want to descend into that as a directory, we
+        # just want to remove the link.  Check islink and treat links as
+        # ordinary files would be treated regardless of what they reference.
         fullpath = os.path.join(path, fn)
         if os.path.islink(fullpath) or not os.path.isdir(fullpath):
             remove(os.remove, fullpath)
@@ -366,9 +350,9 @@ def rmtree(path):
 def safe_makedirs(tree):
     """Creates the directory in a safe manner.
 
-  Because multiple threads can create these directories concurrently, trap the
-  exception and pass on.
-  """
+    Because multiple threads can create these directories concurrently, trap the
+    exception and pass on.
+    """
     count = 0
     while not os.path.exists(tree):
         count += 1
@@ -385,14 +369,13 @@ def safe_makedirs(tree):
 
 def CommandToStr(args):
     """Converts an arg list into a shell escaped string."""
-    return ' '.join(pipes.quote(arg) for arg in args)
+    return ' '.join(shlex.quote(arg) for arg in args)
 
 
 class Wrapper(object):
     """Wraps an object, acting as a transparent proxy for all properties by
-  default.
-  """
-
+    default.
+    """
     def __init__(self, wrapped):
         self._wrapped = wrapped
 
@@ -402,7 +385,6 @@ class Wrapper(object):
 
 class AutoFlush(Wrapper):
     """Creates a file object clone to automatically flush after N seconds."""
-
     def __init__(self, wrapped, delay):
         super(AutoFlush, self).__init__(wrapped)
         if not hasattr(self, 'lock'):
@@ -430,10 +412,9 @@ class AutoFlush(Wrapper):
 
 
 class Annotated(Wrapper):
-    """Creates a file object clone to automatically prepends every line in worker
-  threads with a NN> prefix.
-  """
-
+    """Creates a file object clone to automatically prepends every line in
+    worker threads with a NN> prefix.
+    """
     def __init__(self, wrapped, include_zero=False):
         super(Annotated, self).__init__(wrapped)
         if not hasattr(self, 'lock'):
@@ -452,7 +433,7 @@ class Annotated(Wrapper):
         if not isinstance(out, bytes):
             out = out.encode('utf-8')
 
-        index = getattr(threading.currentThread(), 'index', 0)
+        index = getattr(threading.current_thread(), 'index', 0)
         if not index and not self.__include_zero:
             # Unindexed threads aren't buffered.
             return self._wrapped_write(out)
@@ -460,8 +441,9 @@ class Annotated(Wrapper):
         self.lock.acquire()
         try:
             # Use a dummy array to hold the string so the code can be lockless.
-            # Strings are immutable, requiring to keep a lock for the whole dictionary
-            # otherwise. Using an array is faster than using a dummy object.
+            # Strings are immutable, requiring to keep a lock for the whole
+            # dictionary otherwise. Using an array is faster than using a dummy
+            # object.
             if not index in self.__output_buffers:
                 obj = self.__output_buffers[index] = [b'']
             else:
@@ -529,7 +511,6 @@ GCLIENT_CHILDREN_LOCK = threading.Lock()
 
 
 class GClientChildren(object):
-
     @staticmethod
     def add(popen_obj):
         with GCLIENT_CHILDREN_LOCK:
@@ -587,21 +568,21 @@ def CheckCallAndFilter(args,
                        **kwargs):
     """Runs a command and calls back a filter function if needed.
 
-  Accepts all subprocess2.Popen() parameters plus:
-    print_stdout: If True, the command's stdout is forwarded to stdout.
-    filter_fn: A function taking a single string argument called with each line
-               of the subprocess2's output. Each line has the trailing newline
-               character trimmed.
-    show_header: Whether to display a header before the command output.
-    always_show_header: Show header even when the command produced no output.
-    retry: If the process exits non-zero, sleep for a brief interval and try
-           again, up to RETRY_MAX times.
+    Accepts all subprocess2.Popen() parameters plus:
+        print_stdout: If True, the command's stdout is forwarded to stdout.
+        filter_fn: A function taking a single string argument called with each
+            line of the subprocess2's output. Each line has the trailing
+            newline character trimmed.
+        show_header: Whether to display a header before the command output.
+        always_show_header: Show header even when the command produced no
+            output.
+        retry: If the process exits non-zero, sleep for a brief interval and
+            try again, up to RETRY_MAX times.
 
-  stderr is always redirected to stdout.
+    stderr is always redirected to stdout.
 
-  Returns the output of the command as a binary string.
-  """
-
+    Returns the output of the command as a binary string.
+    """
     def show_header_if_necessary(needs_header, attempt):
         """Show the header at most once."""
         if not needs_header[0]:
@@ -610,7 +591,8 @@ def CheckCallAndFilter(args,
         needs_header[0] = False
         # Automatically generated header. We only prepend a newline if
         # always_show_header is false, since it usually indicates there's an
-        # external progress display, and it's better not to clobber it in that case.
+        # external progress display, and it's better not to clobber it in that
+        # case.
         header = '' if always_show_header else '\n'
         header += '________ running \'%s\' in \'%s\'' % (' '.join(args),
                                                          kwargs.get('cwd', '.'))
@@ -631,8 +613,8 @@ def CheckCallAndFilter(args,
         command_output.seek(line_start)
         filter_fn(command_output.read().decode('utf-8'))
 
-    # Initialize stdout writer if needed. On Python 3, sys.stdout does not accept
-    # byte inputs and sys.stdout.buffer must be used instead.
+    # Initialize stdout writer if needed. On Python 3, sys.stdout does not
+    # accept byte inputs and sys.stdout.buffer must be used instead.
     if print_stdout:
         sys.stdout.flush()
         stdout_write = getattr(sys.stdout, 'buffer', sys.stdout).write
@@ -650,7 +632,7 @@ def CheckCallAndFilter(args,
         # subprocess when filtering its output. This makes the subproc believe
         # it was launched from a terminal, which will preserve ANSI color codes.
         os_type = GetOperatingSystem()
-        if sys.stdout.isatty() and os_type != 'win' and os_type != 'aix':
+        if sys.stdout.isatty() and os_type not in ['win', 'aix', 'zos']:
             pipe_reader, pipe_writer = os.openpty()
         else:
             pipe_reader, pipe_writer = os.pipe()
@@ -670,11 +652,11 @@ def CheckCallAndFilter(args,
         if always_show_header:
             show_header_if_necessary(needs_header, attempt)
 
-        # Also, we need to forward stdout to prevent weird re-ordering of output.
-        # This has to be done on a per byte basis to make sure it is not buffered:
-        # normally buffering is done for each line, but if the process requests
-        # input, no end-of-line character is output after the prompt and it would
-        # not show up.
+        # Also, we need to forward stdout to prevent weird re-ordering of
+        # output. This has to be done on a per byte basis to make sure it is not
+        # buffered: normally buffering is done for each line, but if the process
+        # requests input, no end-of-line character is output after the prompt
+        # and it would not show up.
         try:
             line_start = None
             while True:
@@ -709,8 +691,8 @@ def CheckCallAndFilter(args,
             os.close(pipe_reader)
             rv = kid.wait()
 
-            # Don't put this in a 'finally,' since the child may still run if we get
-            # an exception.
+            # Don't put this in a 'finally,' since the child may still run if we
+            # get an exception.
             GClientChildren.remove(kid)
 
         except KeyboardInterrupt:
@@ -736,21 +718,22 @@ def CheckCallAndFilter(args,
 class GitFilter(object):
     """A filter_fn implementation for quieting down git output messages.
 
-  Allows a custom function to skip certain lines (predicate), and will throttle
-  the output of percentage completed lines to only output every X seconds.
-  """
+    Allows a custom function to skip certain lines (predicate), and will
+    throttle the output of percentage completed lines to only output every X
+    seconds.
+    """
     PERCENT_RE = re.compile('(.*) ([0-9]{1,3})% .*')
 
     def __init__(self, time_throttle=0, predicate=None, out_fh=None):
         """
-    Args:
-      time_throttle (int): GitFilter will throttle 'noisy' output (such as the
-        XX% complete messages) to only be printed at least |time_throttle|
-        seconds apart.
-      predicate (f(line)): An optional function which is invoked for every line.
-        The line will be skipped if predicate(line) returns False.
-      out_fh: File handle to write output to.
-    """
+        Args:
+        time_throttle (int): GitFilter will throttle 'noisy' output (such as the
+            XX% complete messages) to only be printed at least |time_throttle|
+            seconds apart.
+        predicate (f(line)): An optional function which is invoked for every
+            line. The line will be skipped if predicate(line) returns False.
+        out_fh: File handle to write output to.
+        """
         self.first_line = True
         self.last_time = 0
         self.time_throttle = time_throttle
@@ -782,8 +765,8 @@ class GitFilter(object):
 def FindFileUpwards(filename, path=None):
     """Search upwards from the a directory (default: current) to find a file.
 
-  Returns nearest upper-level directory with the passed in file.
-  """
+    Returns nearest upper-level directory with the passed in file.
+    """
     if not path:
         path = os.getcwd()
     path = os.path.realpath(path)
@@ -837,7 +820,6 @@ def GetGClientRootAndEntries(path=None):
 
 def lockedmethod(method):
     """Method decorator that holds self.lock for the duration of the call."""
-
     def inner(self, *args, **kwargs):
         try:
             try:
@@ -862,14 +844,13 @@ class WorkItem(object):
     def __init__(self, name):
         # A unique string representing this work item.
         self._name = name
-        self.outbuf = StringIO()
+        self.outbuf = io.StringIO()
         self.start = self.finish = None
         self.resources = []  # List of resources this work item requires.
 
     def run(self, work_queue):
         """work_queue is passed as keyword argument so it should be
-    the last parameters of the function when you override it."""
-        pass
+        the last parameters of the function when you override it."""
 
     @property
     def name(self):
@@ -878,17 +859,16 @@ class WorkItem(object):
 
 class ExecutionQueue(object):
     """Runs a set of WorkItem that have interdependencies and were WorkItem are
-  added as they are processed.
+    added as they are processed.
 
-  This class manages that all the required dependencies are run
-  before running each one.
+    This class manages that all the required dependencies are run
+    before running each one.
 
-  Methods of this class are thread safe.
-  """
-
+    Methods of this class are thread safe.
+    """
     def __init__(self, jobs, progress, ignore_requirements, verbose=False):
         """jobs specifies the number of concurrent tasks to allow. progress is a
-    Progress instance."""
+        Progress instance."""
         # Set when a thread is done or a new item is enqueued.
         self.ready_cond = threading.Condition()
         # Maximum number of concurrent tasks.
@@ -913,8 +893,8 @@ class ExecutionQueue(object):
 
     def enqueue(self, d):
         """Enqueue one Dependency to be executed later once its requirements are
-    satisfied.
-    """
+        satisfied.
+        """
         assert isinstance(d, WorkItem)
         self.ready_cond.acquire()
         try:
@@ -969,7 +949,8 @@ class ExecutionQueue(object):
                 # Check for task to run first, then wait.
                 while True:
                     if not self.exceptions.empty():
-                        # Systematically flush the queue when an exception logged.
+                        # Systematically flush the queue when an exception
+                        # logged.
                         self.queued = []
                     self._flush_terminated_threads()
                     if (not self.queued and not self.running
@@ -985,12 +966,14 @@ class ExecutionQueue(object):
                                 or not (set(self.queued[i].requirements) -
                                         set(self.ran))):
                             if not self._is_conflict(self.queued[i]):
-                                # Start one work item: all its requirements are satisfied.
+                                # Start one work item: all its requirements are
+                                # satisfied.
                                 self._run_one_task(self.queued.pop(i), args,
                                                    kwargs)
                                 break
                     else:
-                        # Couldn't find an item that could run. Break out the outher loop.
+                        # Couldn't find an item that could run. Break out the
+                        # outher loop.
                         break
 
                 if not self.queued and not self.running:
@@ -999,8 +982,9 @@ class ExecutionQueue(object):
                 # We need to poll here otherwise Ctrl-C isn't processed.
                 try:
                     self.ready_cond.wait(10)
-                    # If we haven't printed to terminal for a while, but we have received
-                    # spew from a suprocess, let the user know we're still progressing.
+                    # If we haven't printed to terminal for a while, but we have
+                    # received spew from a suprocess, let the user know we're
+                    # still progressing.
                     now = datetime.datetime.now()
                     if (now - self.last_join > datetime.timedelta(seconds=60)
                             and self.last_subproc_output > self.last_join):
@@ -1029,7 +1013,8 @@ class ExecutionQueue(object):
                         print(self.format_task_output(i.item, 'interrupted'),
                               file=sys.stderr)
                     raise
-                # Something happened: self.enqueue() or a thread terminated. Loop again.
+                # Something happened: self.enqueue() or a thread terminated.
+                # Loop again.
         finally:
             self.ready_cond.release()
 
@@ -1037,8 +1022,8 @@ class ExecutionQueue(object):
         if not self.exceptions.empty():
             if self.progress:
                 print('')
-            # To get back the stack location correctly, the raise a, b, c form must be
-            # used, passing a tuple as the first argument doesn't work.
+            # To get back the stack location correctly, the raise a, b, c form
+            # must be used, passing a tuple as the first argument doesn't work.
             e, task = self.exceptions.get()
             print(self.format_task_output(task.item, 'ERROR'), file=sys.stderr)
             reraise(e[0], e[1], e[2])
@@ -1103,7 +1088,6 @@ class ExecutionQueue(object):
 
     class _Worker(threading.Thread):
         """One thread to execute one WorkItem."""
-
         def __init__(self, item, index, args, kwargs):
             threading.Thread.__init__(self, name=item.name or 'Worker')
             logging.info('_Worker(%s) reqs:%s' % (item.name, item.requirements))
@@ -1148,16 +1132,16 @@ class ExecutionQueue(object):
 def GetEditor(git_editor=None):
     """Returns the most plausible editor to use.
 
-  In order of preference:
-  - GIT_EDITOR environment variable
-  - core.editor git configuration variable (if supplied by git-cl)
-  - VISUAL environment variable
-  - EDITOR environment variable
-  - vi (non-Windows) or notepad (Windows)
+    In order of preference:
+    - GIT_EDITOR environment variable
+    - core.editor git configuration variable (if supplied by git-cl)
+    - VISUAL environment variable
+    - EDITOR environment variable
+    - vi (non-Windows) or notepad (Windows)
 
-  In the case of git-cl, this matches git's behaviour, except that it does not
-  include dumb terminal detection.
-  """
+    In the case of git-cl, this matches git's behaviour, except that it does not
+    include dumb terminal detection.
+    """
     editor = os.environ.get('GIT_EDITOR') or git_editor
     if not editor:
         editor = os.environ.get('VISUAL')
@@ -1173,24 +1157,38 @@ def GetEditor(git_editor=None):
 
 def RunEditor(content, git, git_editor=None):
     """Opens up the default editor in the system to get the CL description."""
-    file_handle, filename = tempfile.mkstemp(text=True, prefix='cl_description')
+    editor = GetEditor(git_editor=git_editor)
+    if not editor:
+        return None
     # Make sure CRLF is handled properly by requiring none.
     if '\r' in content:
         print('!! Please remove \\r from your change description !!',
               file=sys.stderr)
+
+    file_handle, filename = tempfile.mkstemp(text=True,
+                                             prefix='cl_description.')
     fileobj = os.fdopen(file_handle, 'wb')
     # Still remove \r if present.
     content = re.sub('\r?\n', '\n', content)
     # Some editors complain when the file doesn't end in \n.
     if not content.endswith('\n'):
         content += '\n'
+
+    if 'vim' in editor or editor == 'vi':
+        # If the user is using vim and has 'modelines' enabled, this will change
+        # the filetype from a generic auto-detected 'conf' to 'gitcommit', which
+        # is used to activate proper column wrapping, spell checking, syntax
+        # highlighting for git footers, etc.
+        #
+        # Because of the implementation of GetEditor above, we also check for
+        # the exact string 'vi' here, to help users get a sane default when they
+        # have vi symlink'd to vim (or something like vim).
+        fileobj.write('# vim: ft=gitcommit\n'.encode('utf-8'))
+
     fileobj.write(content.encode('utf-8'))
     fileobj.close()
 
     try:
-        editor = GetEditor(git_editor=git_editor)
-        if not editor:
-            return None
         cmd = '%s %s' % (editor, filename)
         if sys.platform == 'win32' and os.environ.get('TERM') == 'msys':
             # Msysgit requires the usage of 'env' to be present.
@@ -1206,25 +1204,30 @@ def RunEditor(content, git, git_editor=None):
         os.remove(filename)
 
 
+def IsEnvCog():
+    """Returns whether the command is running in a Cog environment."""
+    return os.getcwd().startswith('/google/cog/cloud')
+
+
 def UpgradeToHttps(url):
     """Upgrades random urls to https://.
 
-  Do not touch unknown urls like ssh:// or git://.
-  Do not touch http:// urls with a port number,
-  Fixes invalid GAE url.
-  """
+    Do not touch unknown urls like ssh:// or git://.
+    Do not touch http:// urls with a port number,
+    Fixes invalid GAE url.
+    """
     if not url:
         return url
     if not re.match(r'[a-z\-]+\://.*', url):
         # Make sure it is a valid uri. Otherwise, urlparse() will consider it a
-        # relative url and will use http:///foo. Note that it defaults to http://
-        # for compatibility with naked url like "localhost:8080".
+        # relative url and will use http:///foo. Note that it defaults to
+        # http:// for compatibility with naked url like "localhost:8080".
         url = 'http://%s' % url
-    parsed = list(urlparse.urlparse(url))
+    parsed = list(urllib.parse.urlparse(url))
     # Do not automatically upgrade http to https if a port number is provided.
     if parsed[0] == 'http' and not re.match(r'^.+?\:\d+$', parsed[1]):
         parsed[0] = 'https'
-    return urlparse.urlunparse(parsed)
+    return urllib.parse.urlunparse(parsed)
 
 
 def ParseCodereviewSettingsContent(content):
@@ -1248,12 +1251,12 @@ def ParseCodereviewSettingsContent(content):
 def NumLocalCpus():
     """Returns the number of processors.
 
-  multiprocessing.cpu_count() is permitted to raise NotImplementedError, and
-  is known to do this on some Windows systems and OSX 10.6. If we can't get the
-  CPU count, we will fall back to '1'.
-  """
-    # Surround the entire thing in try/except; no failure here should stop gclient
-    # from working.
+    multiprocessing.cpu_count() is permitted to raise NotImplementedError, and
+    is known to do this on some Windows systems and OSX 10.6. If we can't get
+    the CPU count, we will fall back to '1'.
+    """
+    # Surround the entire thing in try/except; no failure here should stop
+    # gclient from working.
     try:
         # Use multiprocessing to get CPU count. This may raise
         # NotImplementedError.
@@ -1290,10 +1293,10 @@ def GetWindowsArchitecture():
 def DefaultDeltaBaseCacheLimit():
     """Return a reasonable default for the git config core.deltaBaseCacheLimit.
 
-  The primary constraint is the address space of virtual memory.  The cache
-  size limit is per-thread, and 32-bit systems can hit OOM errors if this
-  parameter is set too high.
-  """
+    The primary constraint is the address space of virtual memory.  The cache
+    size limit is per-thread, and 32-bit systems can hit OOM errors if this
+    parameter is set too high.
+    """
     try:
         is_64bit = "AMD64" == GetWindowsArchitecture()
     except KeyError:
@@ -1309,8 +1312,8 @@ def DefaultDeltaBaseCacheLimit():
 def DefaultIndexPackConfig(url=''):
     """Return reasonable default values for configuring git-index-pack.
 
-  Experiments suggest that higher values for pack.threads don't improve
-  performance."""
+    Experiments suggest that higher values for pack.threads don't improve
+    performance."""
     cache_limit = DefaultDeltaBaseCacheLimit()
     result = ['-c', 'core.deltaBaseCacheLimit=%s' % cache_limit]
     if url in THREADED_INDEX_PACK_BLOCKLIST:
@@ -1340,16 +1343,16 @@ def FindExecutable(executable):
 def freeze(obj):
     """Takes a generic object ``obj``, and returns an immutable version of it.
 
-  Supported types:
-    * dict / OrderedDict -> FrozenDict
-    * list -> tuple
-    * set -> frozenset
-    * any object with a working __hash__ implementation (assumes that hashable
-      means immutable)
+    Supported types:
+        * dict / OrderedDict -> FrozenDict
+        * list -> tuple
+        * set -> frozenset
+        * any object with a working __hash__ implementation (assumes that
+            hashable means immutable)
 
-  Will raise TypeError if you pass an object which is not hashable.
-  """
-    if isinstance(obj, collections_abc.Mapping):
+    Will raise TypeError if you pass an object which is not hashable.
+    """
+    if isinstance(obj, collections.abc.Mapping):
         return FrozenDict((freeze(k), freeze(v)) for k, v in obj.items())
 
     if isinstance(obj, (list, tuple)):
@@ -1362,12 +1365,11 @@ def freeze(obj):
     return obj
 
 
-class FrozenDict(collections_abc.Mapping):
+class FrozenDict(collections.abc.Mapping):
     """An immutable OrderedDict.
 
-  Modified From: http://stackoverflow.com/a/2704866
-  """
-
+    Modified From: http://stackoverflow.com/a/2704866
+    """
     def __init__(self, *args, **kwargs):
         self._d = collections.OrderedDict(*args, **kwargs)
 
@@ -1378,7 +1380,7 @@ class FrozenDict(collections_abc.Mapping):
                                        for i in enumerate(self._d.items())), 0)
 
     def __eq__(self, other):
-        if not isinstance(other, collections_abc.Mapping):
+        if not isinstance(other, collections.abc.Mapping):
             return NotImplemented
         if self is other:
             return True
@@ -1403,3 +1405,16 @@ class FrozenDict(collections_abc.Mapping):
 
     def __repr__(self):
         return 'FrozenDict(%r)' % (self._d.items(), )
+
+
+def merge_conditions(*conditions):
+    """combine multiple conditions into one expression"""
+    condition = None
+    for current_condition in conditions:
+        if not current_condition:
+            continue
+        if not condition:
+            condition = current_condition
+            continue
+        condition = f'({condition}) and ({current_condition})'
+    return condition
