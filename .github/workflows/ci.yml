@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - master
+      - develop
+      - feature/**
+  push:
+    branches:
+      - master
+      - develop
+      - feature/**
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.ref }}-${{ github.workflow }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+jobs:
+  git-deps-posix:
+    name: git deps
+    continue-on-error: false
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: Setup test DEPS
+        run: |
+          cat > DEPS << EOF
+          vars = {
+              'github_gnified': 'https://github.com/gnified',
+          }
+          deps = {
+              'external/boringssl': Var('github_gnified') + '/boringssl.git@d09438328356b2fff277029d5fe7b375a22433c3',
+              'external/cryptopp': 'https://github.com/weidai11/cryptopp.git@CRYPTOPP_8_5_0',
+          }
+          recursedeps = [
+            'external/boringssl',
+          ]
+          EOF
+          chmod +x gclient
+          ./gclient
+
+      - name: Update DEPS
+        run: |
+          ./gclient sync --force --reset --delete_unversioned_trees
+
+      - name: Update DEPS - idempotency
+        run: |
+          ./gclient sync --verbose --force --reset --delete_unversioned_trees
+
+      - name: Test misc. commands
+        run: |
+          ./gclient root
+          ./gclient recurse -j1 git remote -v
