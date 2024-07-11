@@ -22,6 +22,7 @@ import traceback
 import gclient_utils
 import git_common
 import scm
+import scm_p4
 import subprocess2
 
 # TODO: Should fix these warnings.
