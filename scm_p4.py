@@ -82,7 +82,7 @@ def format_client_name(checkout_path: str, parsed_url: PerforceWorkspaceUrl):
         client_name_template = "{user}_{host}_{depot_path_as_name}_{suffix}"
     return client_name_template.format(
         user=parsed_url.username or os.environ.get('P4USER'),
-        host=socket.getfqdn().rpartition('.')[2],
+        host=socket.getfqdn().partition('.')[0],
         depot_path_as_name=parsed_url.path[2:].replace('/', '_'),
         suffix=zlib.crc32(checkout_path.encode('utf-8')))
 
@@ -207,7 +207,7 @@ def make_client_spec(ctx: P4Context,
     if options is None:
         options = []
     if not host:
-        host = socket.getfqdn()
+        host = socket.getfqdn().partition('.')[0]
     if not owner:
         owner = ctx.user
     if description is None:
