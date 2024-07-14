@@ -2032,6 +2032,7 @@ class GClient(GitDependency):
             if (entry not in entries and
                 (not any(path.startswith(entry + '/') for path in entries))
                     and os.path.exists(e_dir)):
+                print('Entry %s not in %s' % (entry, str(entries)))
                 # The entry has been removed from DEPS.
                 scm = gclient_scm.GitWrapper(prev_url, self.root_dir,
                                              entry_fixed, self.outbuf)
