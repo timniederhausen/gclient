@@ -75,19 +75,35 @@ def encode_marshalled_command_input(input: typing.Dict[typing.AnyStr,
     return marshal.dumps({_encode(k): v for k, v in input.items()}, 0)
 
 
-def format_client_name(checkout_path: str, parsed_url: PerforceWorkspaceUrl):
+def format_client_name(checkout_path: str, user: str, path: str):
     try:
         client_name_template = os.environ['P4CLIENT_TEMPLATE']
     except KeyError:
         client_name_template = "{user}_{host}_{depot_path_as_name}_{suffix}"
     return client_name_template.format(
-        user=parsed_url.username or os.environ.get('P4USER'),
-        host=socket.getfqdn().partition('.')[0],
-        depot_path_as_name=parsed_url.path[2:].replace('/', '_'),
+        user=user, host=socket.getfqdn().partition('.')[0],
+        depot_path_as_name=path[2:].replace('/', '_'),
         suffix=zlib.crc32(checkout_path.encode('utf-8')))
 
 
-class P4Environment(object):
+def get_workspace_environment(checkout_path: str):
+    records = {k.upper(): v for k, v in os.environ.items()}
+    try:
+        output = subprocess.check_output(
+            ['p4', 'set', '-q'], cwd=checkout_path,
+            universal_newlines=True).split('\n')
+    except subprocess.CalledProcessError:
+        return records
+    except FileNotFoundError: # cwd does not exist
+        return records
+
+    for line in output:
+        tokens = line.partition('=')
+        records[tokens[0]] = tokens[2]
+    return records
+
+
+class P4Context(object):
 
     def __init__(self,
                  port: str = None,
@@ -98,31 +114,6 @@ class P4Environment(object):
         self.user = user
         self.passwd = passwd
         self.client = client
-
-    @staticmethod
-    def from_workspace(checkout_path: str):
-        try:
-            output = subprocess.check_output(
-                ['p4', 'set', '-q'], cwd=checkout_path,
-                universal_newlines=True).split('\n')
-        except subprocess.CalledProcessError:
-            return P4Environment()
-        except FileNotFoundError: # cwd does not exist
-            return P4Environment()
-
-        if not output:
-            raise RuntimeError(f'Empty response from p4 set')
-
-        records = {}
-        for line in output:
-            tokens = line.partition('=')
-            records[tokens[0]] = tokens[2]
-
-        return P4Environment(records.get('P4PORT'), records.get('P4USER'),
-                             records.get('P4PASSWD'), records.get('P4CLIENT'))
-
-
-class P4Context(P4Environment):
 
     def prepare_environment(self, kwargs):
         env = kwargs.pop('env', None) or os.environ.copy()
@@ -178,14 +169,14 @@ class P4Context(P4Environment):
 
     @staticmethod
     def for_checkout(checkout_path: str, url: str, client_name: str = None):
+        default_environment = get_workspace_environment(checkout_path)
         parsed_url = parse_workspace_url(url)
-        default_environment = P4Environment.from_workspace(checkout_path)
-        user = parsed_url.username or default_environment.user
+        user = parsed_url.username or default_environment.get('P4USER')
         password = parsed_url.password or os.environ.get('P4PASSWD')
         if client_name is None:
-            client_name = default_environment.client
+            client_name = default_environment.get('P4CLIENT')
         if client_name is None:
-            client_name = format_client_name(checkout_path, parsed_url)
+            client_name = format_client_name(checkout_path, user, parsed_url.path)
         return P4Context(parsed_url.port, user, password, client_name)
 
 
