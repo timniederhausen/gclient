@@ -39,6 +39,10 @@ def parse_workspace_url(url: str):
                                 depot_type, changelist)
 
 
+def _get_hostname():
+    return socket.gethostname()
+
+
 def unmarshal_p4_output(stdout: bytes, check=False):
     # https://www.perforce.com/manuals/p4api.net/p4api.net_reference/html/T_Perforce_P4_ErrorSeverity.htm
     E_FAILED = 3
@@ -81,7 +85,7 @@ def format_client_name(checkout_path: str, user: str, path: str):
     except KeyError:
         client_name_template = "{user}_{host}_{depot_path_as_name}_{suffix}"
     return client_name_template.format(
-        user=user, host=socket.getfqdn().partition('.')[0],
+        user=user, host=_get_hostname(),
         depot_path_as_name=path[2:].replace('/', '_'),
         suffix=zlib.crc32(checkout_path.encode('utf-8')))
 
@@ -200,7 +204,7 @@ def make_client_spec(ctx: P4Context,
     if options is None:
         options = []
     if not host:
-        host = socket.getfqdn().partition('.')[0]
+        host = _get_hostname()
     if not owner:
         owner = ctx.user
     if description is None:
