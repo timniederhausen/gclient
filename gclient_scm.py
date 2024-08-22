@@ -2167,6 +2167,8 @@ class P4Wrapper(SCMWrapper):
                                       ",".join(args))
 
         self._CreateClient()
+        if not os.path.isdir(self.checkout_path):
+            gclient_utils.safe_makedirs(self.checkout_path)
 
         parsed_url = scm_p4.parse_workspace_url(self.url)
         revision = options.revision or parsed_url.changelist
