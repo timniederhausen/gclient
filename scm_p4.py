@@ -107,6 +107,8 @@ class P4Environment(object):
                 universal_newlines=True).split('\n')
         except subprocess.CalledProcessError:
             return P4Environment()
+        except FileNotFoundError: # cwd does not exist
+            return P4Environment()
 
         if not output:
             raise RuntimeError(f'Empty response from p4 set')
